@@ -213,7 +213,7 @@ Example:
 
 ```json
 {
-  "username": "24105157001",
+  "username": "",
   "password": "your-password",
   "username_rotation": {
     "enabled": true,
@@ -237,8 +237,9 @@ Example:
 
 | Field | Meaning |
 |---|---|
-| `username` / `password` | Your own portal credentials. |
-| `username_rotation` | New configs enable it. On each login the last `digits` digits of `username` (which must already be digits) are replaced by a number from `min` to `max`, inclusive. Set `enabled` to `false` to keep one fixed username. The password is unchanged. |
+| `username` | Optional when rotation is enabled. Leave it empty to use the random suffix as the whole username. If set, its last `digits` characters must be digits and are replaced; the prefix is kept. |
+| `password` | Shared portal password. Required. |
+| `username_rotation` | New configs enable it. On each login a number from `min` to `max` replaces the trailing `digits` characters of `username`, or becomes the whole username when `username` is empty. Set `enabled` to `false` to keep one fixed username. |
 | `portal_url` | Optional seed URL used when the gateway's logout page cannot be parsed. The last successful URL is also remembered in `state.json`. |
 | `portal_hosts` | Allow-list of controller hosts. Credentials are **only** sent to these hosts. Add the IP/hostname of your controller. |
 | `check_urls` | Plain-HTTP URLs intercepted by the captive portal. HTTPS checks are bypassed by most gateways and are less useful. |
@@ -247,11 +248,26 @@ Example:
 | `retry_max_seconds` | Retry delay cap, 5–3600, default 60. |
 | `timeout_seconds` | Per-request timeout, 1–120, default 8. |
 
-### Randomized username rotation
+### Randomized usernames
 
-New configs rotate the last three digits of `username` through `001`–`112` on
-every login attempt. If the accounts are `24105157001` through `24105157112`, use
-the shared prefix with three trailing digits as the base:
+New configs need no username at all. On each login the tool sends a random
+three-digit username from `001`–`112` with the shared password:
+
+```sh
+omada-autologin init --password 'your-password'
+```
+
+The generated suffix is the complete username; the tool never asks for a
+registration number. `status` shows:
+
+```
+user:   (generated)
+rotate: random last 3 digits (001-112)
+```
+
+If the portal usernames have a fixed prefix, such as `24105157001` through
+`24105157112`, pass that prefix as `--username`. Only the last three digits
+change:
 
 ```sh
 omada-autologin init --username 24105157001 --password 'your-password'
@@ -265,7 +281,7 @@ pick the same suffix. A daemon restart starts a new shuffle.
 Use a different range in one step:
 
 ```sh
-omada-autologin init --username 24105157001 --password '...' --random-range 020-112
+omada-autologin init --password 'your-password' --random-range 020-112
 ```
 
 Or update an existing config without retyping the password:
@@ -273,16 +289,12 @@ Or update an existing config without retyping the password:
 ```sh
 omada-autologin randomize --range 020-112
 omada-autologin randomize              # restore the default 001-112
-omada-autologin randomize --off        # keep one fixed username
+omada-autologin randomize --off        # keep one fixed username (must already be set)
 ```
 
-`init --fixed` also creates a fixed-username config. The last `digits`
-characters of `username` must already be digits; only that suffix changes.
-`status` shows the active range:
-
-```
-rotate: random last 3 digits (001-112)
-```
+`init --fixed --username NAME` creates a fixed-username config. When a prefix is
+used, the last `digits` characters of `username` must already be digits; only
+that suffix changes.
 
 The range is inclusive and bounded; the tool never sends a username outside it.
 Enable rotation only when every username in the range belongs to you or is a
@@ -304,7 +316,7 @@ launchctl kickstart -k gui/$(id -u)/com.omada.autologin   # macOS, restarts
 
 | Command | Purpose |
 |---|---|
-| `init` | Create config. New configs rotate the last 3 username digits through 001–112. Flags: `--username`, `--password`, `--host`, `--portal-url`, `--random-range`, `--rotate-last`, `--rotate-min`, `--rotate-max`, `--fixed`, `--force`. |
+| `init` | Create config. Omit `--username` to generate a random 3-digit username (001–112); pass it to keep a fixed prefix and rotate only the suffix. Flags: `--username`, `--password`, `--host`, `--portal-url`, `--random-range`, `--rotate-last`, `--rotate-min`, `--rotate-max`, `--fixed`, `--force`. |
 | `once` | One check: log in only if the network is captive. `--force` logs in even when online; `--dry-run` prints the request without sending credentials; `--url` uses a specific portal URL. |
 | `login` | Same as `once --force`. |
 | `run` | Run the daemon in the foreground (debugging or your own supervisor). `--interval` temporarily overrides config. |

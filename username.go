@@ -54,14 +54,19 @@ func (r *usernameRotator) next(cfg *Config) (string, error) {
 	if digits < 1 || digits > maxSuffixDigits {
 		return "", fmt.Errorf("username_rotation.digits must be between 1 and %d (got %d)", maxSuffixDigits, digits)
 	}
-	if !hasTrailingDigits(cfg.Username, digits) {
-		return "", fmt.Errorf("username_rotation: username %q must end with at least %d digits", cfg.Username, digits)
+	base := strings.TrimSpace(cfg.Username)
+	if base != "" && !hasTrailingDigits(base, digits) {
+		return "", fmt.Errorf("username_rotation: username %q must end with at least %d digits", base, digits)
 	}
 	if rot.Min < 1 || rot.Max < rot.Min || rot.Max > pow10(digits)-1 {
 		return "", fmt.Errorf("invalid username_rotation range %d-%d for %d digits", rot.Min, rot.Max, digits)
 	}
 	n := r.draw(rot.Min, rot.Max)
-	return cfg.Username[:len(cfg.Username)-digits] + fmt.Sprintf("%0*d", digits, n), nil
+	suffix := fmt.Sprintf("%0*d", digits, n)
+	if base == "" {
+		return suffix, nil
+	}
+	return base[:len(base)-digits] + suffix, nil
 }
 
 func (r *usernameRotator) draw(min, max int) int {

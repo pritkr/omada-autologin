@@ -136,6 +136,50 @@ func TestUsernameRotatorDisabled(t *testing.T) {
 	}
 }
 
+func TestUsernameRotatorWithoutBase(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Username = ""
+	cfg.Password = "test-pass"
+	cfg.applyDefaults()
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("empty username with rotation should validate: %v", err)
+	}
+
+	var rot usernameRotator
+	seen := make(map[int]bool, 112)
+	for i := 0; i < 112; i++ {
+		got, err := rot.next(&cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("generated username %q is not a three-digit suffix", got)
+		}
+		n, err := strconv.Atoi(got)
+		if err != nil || n < 1 || n > 112 {
+			t.Fatalf("generated username out of range: %q", got)
+		}
+		if seen[n] {
+			t.Fatalf("suffix %03d repeated before the cycle ended", n)
+		}
+		seen[n] = true
+	}
+	if len(seen) != 112 {
+		t.Fatalf("saw %d distinct usernames, want 112", len(seen))
+	}
+}
+
+func TestEmptyUsernameRequiresRotation(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Username = ""
+	cfg.Password = "test-pass"
+	cfg.UsernameRotation = nil
+	cfg.applyDefaults()
+	if err := cfg.validate(); err == nil {
+		t.Fatal("expected an empty-username error when rotation is disabled")
+	}
+}
+
 func TestFixedUsernameConfigIsValid(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.Username = "plainuser"

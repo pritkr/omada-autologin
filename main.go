@@ -106,9 +106,9 @@ Usage:
   %s uninstall
   %s version
 
-New configs randomize the last 3 username digits through 001-112 on every
-login. Use init --fixed to keep one username, or randomize to change an
-existing config.
+New configs need no username: each login uses a random 3-digit username
+(001-112). Pass --username to keep a fixed prefix, or --fixed to disable
+rotation. Use randomize to change an existing config.
 
 Common flags:
   --config PATH   use a different config file
@@ -242,12 +242,17 @@ func cmdInit(args []string) int {
 	}
 
 	interactive := term.IsTerminal(int(os.Stdin.Fd()))
-	if interactive && c.Username == "" {
+	if interactive && c.Username == "" && !c.rotatesUsername() {
 		v, err := prompt("Username / registration number: ", false)
 		if err != nil {
 			return fail(err)
 		}
 		c.Username = strings.TrimSpace(v)
+	}
+	if strings.TrimSpace(c.Username) != "" {
+		if err := checkRotationUsername(&c, "--fixed"); err != nil {
+			return fail(err)
+		}
 	}
 	if interactive && c.Password == "" {
 		v, err := prompt("Password: ", true)
@@ -276,15 +281,15 @@ func cmdInit(args []string) int {
 			c.PortalURL = v
 		}
 	}
-	if err := checkRotationUsername(&c, "--fixed"); err != nil {
-		return fail(err)
-	}
 	if err := saveConfig(path, &c); err != nil {
 		return fail(err)
 	}
 	fmt.Printf("wrote %s\n", path)
 	if desc := c.UsernameRotation.description(); desc != "" {
 		fmt.Printf("username rotation: %s\n", desc)
+	}
+	if c.Username == "" {
+		fmt.Println("username: generated from the rotated suffix")
 	}
 	fmt.Printf("next: %s once --dry-run\n", appName)
 	if os.Geteuid() != 0 {
@@ -296,6 +301,9 @@ func cmdInit(args []string) int {
 func checkRotationUsername(c *Config, fixedHint string) error {
 	r := c.UsernameRotation
 	if r == nil || !r.Enabled {
+		return nil
+	}
+	if strings.TrimSpace(c.Username) == "" {
 		return nil
 	}
 	digits := r.digitsOrDefault()
@@ -659,7 +667,11 @@ func cmdStatus(args []string) int {
 	} else {
 		fmt.Println("portal: not found")
 	}
-	fmt.Printf("user:   %s\n", report.Username)
+	user := report.Username
+	if user == "" {
+		user = "(generated)"
+	}
+	fmt.Printf("user:   %s\n", user)
 	if report.UsernameRotation != "" {
 		fmt.Printf("rotate: %s\n", report.UsernameRotation)
 	}
@@ -725,6 +737,9 @@ func cmdRandomize(args []string) int {
 	defer a.close()
 
 	if *off {
+		if strings.TrimSpace(a.cfg.Username) == "" {
+			return fail(errors.New("randomize --off needs a fixed username; create one with: init --fixed --username NAME"))
+		}
 		a.cfg.UsernameRotation = nil
 		if err := saveConfig(a.cfgPath, a.cfg); err != nil {
 			return fail(err)
@@ -746,7 +761,10 @@ func cmdRandomize(args []string) int {
 		if err := saveConfig(a.cfgPath, a.cfg); err != nil {
 			return fail(err)
 		}
-		prefix := a.cfg.Username[:len(a.cfg.Username)-digits]
+		prefix := ""
+		if a.cfg.Username != "" {
+			prefix = a.cfg.Username[:len(a.cfg.Username)-digits]
+		}
 		fmt.Printf("username rotation: %s\n", a.cfg.UsernameRotation.description())
 		fmt.Printf("usernames:         %s%0*d ... %s%0*d\n",
 			prefix, digits, min, prefix, digits, max)

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand/v2"
 	"net/http"
 	"strings"
 	"time"
@@ -109,39 +108,6 @@ func (m authMethod) payload(cfg *Config, ctx *PortalContext, username string) ma
 	return p
 }
 
-// loginUsername picks the username for one attempt. Rotation only ever changes
-// the trailing digits of the configured username; it never invents a different
-// prefix.
-func (c *Config) loginUsername() string {
-	r := c.UsernameRotation
-	if r == nil || !r.Enabled {
-		return c.Username
-	}
-	return r.pick(c.Username)
-}
-
-func (r *UsernameRotation) pick(base string) string {
-	if r == nil || !r.Enabled {
-		return base
-	}
-	span := r.Max - r.Min + 1
-	if span <= 0 {
-		return base
-	}
-	return r.pickN(base, rand.IntN(span))
-}
-
-// pickN is split out so tests can exercise both ends of the range without
-// depending on the random source.
-func (r *UsernameRotation) pickN(base string, offset int) string {
-	digits := r.digitsOrDefault()
-	if digits > len(base) {
-		return base
-	}
-	n := r.Min + offset
-	return base[:len(base)-digits] + fmt.Sprintf("%0*d", digits, n)
-}
-
 func maskedPayload(p map[string]any) string {
 	copy := make(map[string]any, len(p))
 	for k, v := range p {
@@ -166,7 +132,12 @@ type loginResult struct {
 // doLogin performs one portal authentication attempt. It is used by tests and
 // by one-off callers; the daemon passes a username from its rotator instead.
 func doLogin(cfg *Config, ctx *PortalContext, dryRun bool, log *Logger) error {
-	return doLoginAs(cfg, ctx, cfg.loginUsername(), dryRun, log)
+	var rot usernameRotator
+	username, err := rot.next(cfg)
+	if err != nil {
+		return err
+	}
+	return doLoginAs(cfg, ctx, username, dryRun, log)
 }
 
 // doLoginAs is doLogin with an explicit attempt username, so the daemon can
@@ -201,10 +172,7 @@ func doLoginAs(cfg *Config, ctx *PortalContext, username string, dryRun bool, lo
 		return err
 	}
 
-	sentUsername := cfg.Username
-	if method.usesUsername() {
-		sentUsername = username
-	}
+	sentUsername := username
 	payload := method.payload(cfg, ctx, sentUsername)
 	if dryRun {
 		fmt.Printf("portal:     %s\n", ctx.PortalURL)

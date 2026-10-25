@@ -130,26 +130,6 @@ func TestMaskedPayloadHidesSecrets(t *testing.T) {
 	}
 }
 
-func TestUsernameRotationPick(t *testing.T) {
-	r := &UsernameRotation{Enabled: true, Digits: 3, Min: 1, Max: 112}
-	if got := r.pickN("22BCS12345", 0); got != "22BCS12001" {
-		t.Fatalf("first value = %q", got)
-	}
-	if got := r.pickN("22BCS12345", 111); got != "22BCS12112" {
-		t.Fatalf("last value = %q", got)
-	}
-	for i := 0; i < 100; i++ {
-		got := r.pick("22BCS12345")
-		if !strings.HasPrefix(got, "22BCS12") || len(got) != len("22BCS12345") {
-			t.Fatalf("unexpected username %q", got)
-		}
-		n, err := strconv.Atoi(got[len(got)-3:])
-		if err != nil || n < 1 || n > 112 {
-			t.Fatalf("suffix out of range in %q", got)
-		}
-	}
-}
-
 func TestDoLoginDryRunUsesRotatedUsername(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/portal/getPortalPageSetting" {
@@ -207,17 +187,6 @@ func TestDoLoginDryRunUsesRotatedUsername(t *testing.T) {
 	n, err := strconv.Atoi(picked[len(picked)-3:])
 	if err != nil || n < 1 || n > 112 {
 		t.Fatalf("suffix out of range in %q", picked)
-	}
-}
-
-func TestLoginUsernameRotationOff(t *testing.T) {
-	cfg := &Config{Username: "22BCS12345"}
-	if got := cfg.loginUsername(); got != cfg.Username {
-		t.Fatalf("got %q", got)
-	}
-	cfg.UsernameRotation = &UsernameRotation{Enabled: false, Digits: 3, Min: 1, Max: 112}
-	if got := cfg.loginUsername(); got != cfg.Username {
-		t.Fatalf("disabled rotation changed username to %q", got)
 	}
 }
 

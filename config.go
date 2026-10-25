@@ -98,6 +98,7 @@ func defaultConfig() Config {
 
 func (c *Config) applyDefaults() {
 	d := defaultConfig()
+	c.Username = strings.TrimSpace(c.Username)
 	if len(c.PortalHosts) == 0 {
 		c.PortalHosts = d.PortalHosts
 	}
@@ -144,6 +145,11 @@ func (r *UsernameRotation) applyDefaults() {
 	}
 }
 
+// rotatesUsername reports whether a username is generated per login.
+func (c *Config) rotatesUsername() bool {
+	return c.UsernameRotation != nil && c.UsernameRotation.Enabled
+}
+
 // description is a short human-readable summary for status and logs.
 func (r *UsernameRotation) description() string {
 	if r == nil || !r.Enabled {
@@ -161,7 +167,7 @@ func (r *UsernameRotation) validate(username string) error {
 	if digits < 1 || digits > maxSuffixDigits {
 		return fmt.Errorf("username_rotation.digits must be between 1 and %d (got %d)", maxSuffixDigits, digits)
 	}
-	if !hasTrailingDigits(username, digits) {
+	if strings.TrimSpace(username) != "" && !hasTrailingDigits(username, digits) {
 		return fmt.Errorf("username_rotation: username %q must end with at least %d digits", username, digits)
 	}
 	limit := pow10(digits)
@@ -181,8 +187,8 @@ func (r *UsernameRotation) validate(username string) error {
 }
 
 func (c *Config) validate() error {
-	if strings.TrimSpace(c.Username) == "" {
-		return errors.New("username is empty")
+	if c.Username == "" && !c.rotatesUsername() {
+		return errors.New("username is empty (set username or enable username_rotation)")
 	}
 	if c.Password == "" {
 		return errors.New("password is empty")
