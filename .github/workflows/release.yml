@@ -38,15 +38,16 @@ jobs:
           mkdir -p dist
           ext=""
           if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
-          name="omada-autologin_${VERSION}_${GOOS}_${GOARCH}"
-          go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o "dist/${name}${ext}" .
+          pkg="omada-autologin_${VERSION}_${GOOS}_${GOARCH}"
+          mkdir -p "dist/${pkg}"
+          go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o "dist/${pkg}/omada-autologin${ext}" .
+          cp README.md LICENSE "dist/${pkg}/"
           if [ "$GOOS" = "windows" ]; then
-            (cd dist && zip -q "${name}.zip" "${name}${ext}")
-            rm "dist/${name}${ext}"
+            (cd dist && zip -qr "${pkg}.zip" "${pkg}")
           else
-            (cd dist && tar -czf "${name}.tar.gz" "${name}")
-            rm "dist/${name}"
+            (cd dist && tar -czf "${pkg}.tar.gz" "${pkg}")
           fi
+          rm -rf "dist/${pkg}"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.goos }}-${{ matrix.goarch }}

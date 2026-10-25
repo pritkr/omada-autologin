@@ -1,5 +1,8 @@
 # omada-autologin
 
+[![CI](https://github.com/pritkr/omada-autologin/actions/workflows/ci.yml/badge.svg)](https://github.com/pritkr/omada-autologin/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/pritkr/omada-autologin)](https://github.com/pritkr/omada-autologin/releases)
+
 Keep an [TP-Link Omada](https://www.tp-link.com/en/omada-sdn/) captive-portal
 session alive on **macOS, Linux and Windows**.
 
