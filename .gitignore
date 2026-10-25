@@ -1,0 +1,6 @@
+/omada-autologin
+/omada-autologin.exe
+/omada-autologin-*
+/dist/
+*.log
+.DS_Store
