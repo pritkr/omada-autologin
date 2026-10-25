@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"strconv"
@@ -55,7 +56,11 @@ func (r *usernameRotator) next(cfg *Config) (string, error) {
 		return "", fmt.Errorf("username_rotation.digits must be between 1 and %d (got %d)", maxSuffixDigits, digits)
 	}
 	base := strings.TrimSpace(cfg.Username)
-	if base != "" && !hasTrailingDigits(base, digits) {
+	if base == "" {
+		if !rot.SuffixOnly {
+			return "", errors.New("username is empty and username_rotation.suffix_only is not set")
+		}
+	} else if !hasTrailingDigits(base, digits) {
 		return "", fmt.Errorf("username_rotation: username %q must end with at least %d digits", base, digits)
 	}
 	if rot.Min < 1 || rot.Max < rot.Min || rot.Max > pow10(digits)-1 {

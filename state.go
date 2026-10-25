@@ -15,6 +15,7 @@ type State struct {
 	FailCount     int    `json:"fail_count"`
 	LastAttempt   int64  `json:"last_attempt,omitempty"`
 	LastPortalURL string `json:"last_portal_url,omitempty"`
+	LastSSID      string `json:"last_ssid,omitempty"`
 	LastSuccess   int64  `json:"last_success,omitempty"`
 	LastError     string `json:"last_error,omitempty"`
 }
@@ -67,7 +68,7 @@ func (s *stateStore) recordFailure(msg string) {
 	_ = s.save(st)
 }
 
-func (s *stateStore) recordSuccess(portalURL string) {
+func (s *stateStore) recordSuccess(portalURL, ssid string) {
 	st := s.load()
 	st.FailCount = 0
 	st.LastAttempt = time.Now().Unix()
@@ -76,6 +77,19 @@ func (s *stateStore) recordSuccess(portalURL string) {
 	if portalURL != "" {
 		st.LastPortalURL = portalURL
 	}
+	if ssid != "" {
+		st.LastSSID = ssid
+	}
+	_ = s.save(st)
+}
+
+// clearPortalURL forgets a stale entry URL while keeping the learned SSID.
+func (s *stateStore) clearPortalURL() {
+	st := s.load()
+	if st.LastPortalURL == "" {
+		return
+	}
+	st.LastPortalURL = ""
 	_ = s.save(st)
 }
 

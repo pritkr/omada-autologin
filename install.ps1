@@ -8,7 +8,8 @@ param(
     [string]$Version = "latest",
     [string]$InstallDir = "$env:LOCALAPPDATA\omada-autologin\bin",
     [switch]$NoService,
-    [switch]$NoLogin
+    [switch]$NoLogin,
+    [switch]$RandomOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -99,9 +100,14 @@ try {
         Write-Host "existing config found; keeping it"
     }
     elseif ($env:OMADA_PASSWORD) {
+        $randomOnly = $RandomOnly -or ($env:OMADA_RANDOM_ONLY -eq "1")
+        if (-not $env:OMADA_USERNAME -and -not $randomOnly) {
+            throw "OMADA_USERNAME is required for unattended setup (or pass -RandomOnly / set OMADA_RANDOM_ONLY=1 to send bare generated suffixes)"
+        }
         $initArgs = @("init", "--password", $env:OMADA_PASSWORD)
         if ($env:OMADA_HOST) { $initArgs += @("--host", $env:OMADA_HOST) }
         if ($env:OMADA_USERNAME) { $initArgs += @("--username", $env:OMADA_USERNAME) }
+        if ($randomOnly) { $initArgs += @("--random-only") }
         Invoke-Native $exe $initArgs
         if ($script:NativeExit -ne 0) { throw "config setup failed" }
         $configured = $true

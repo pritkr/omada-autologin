@@ -19,6 +19,11 @@ const (
 	// fixed username.
 	defaultSuffixDigits = 3
 	defaultSuffixMax    = 112
+
+	// Login retries are deliberately small: enough to survive one bad suffix
+	// or a portal timeout, without hammering the controller.
+	defaultLoginAttempts = 3
+	defaultLoginSettle   = 8
 )
 
 // Config is the on-disk configuration. It is intentionally small: one
@@ -32,6 +37,20 @@ type Config struct {
 	// of Username (which must be digits) are replaced with a random number
 	// from [Min, Max] on every login attempt. The password is unchanged.
 	UsernameRotation *UsernameRotation `json:"username_rotation,omitempty"`
+
+	// WiFi reconnects to a known/saved Wi-Fi network when the link drops or
+	// the portal becomes unreachable. It never joins an arbitrary network:
+	// targets come from SSIDs below and the last SSID that successfully
+	// served the portal.
+	WiFi *WiFiConfig `json:"wifi,omitempty"`
+
+	// LoginAttempts is how many usernames to try in one check before backing
+	// off. Defaults to 3.
+	LoginAttempts int `json:"login_attempts,omitempty"`
+
+	// LoginSettleSeconds is how long to wait for internet after the portal
+	// accepts a login. Defaults to 8.
+	LoginSettleSeconds int `json:"login_settle_seconds,omitempty"`
 
 	// PortalURL is an optional last-known-good portal entry URL. It is used
 	// when the gateway's interception page cannot be parsed.
@@ -67,6 +86,27 @@ type UsernameRotation struct {
 	// Min and Max bound the replacement number, inclusive.
 	Min int `json:"min,omitempty"`
 	Max int `json:"max,omitempty"`
+	// SuffixOnly intentionally sends just the generated number, with no
+	// username prefix. It is only valid when username is empty.
+	SuffixOnly bool `json:"suffix_only,omitempty"`
+}
+
+// WiFiConfig controls automatic Wi-Fi recovery. Passwords are never stored
+// here: networks must already be saved in the OS keychain / connection
+// manager, so the daemon can reconnect without handling a secret.
+type WiFiConfig struct {
+	Enabled bool `json:"enabled"`
+	// Interface overrides auto-detection (for example "en0" on macOS).
+	Interface string `json:"interface,omitempty"`
+	// SSIDs are tried in order when the link is down. The last SSID that
+	// successfully served the portal is also remembered in state.json.
+	SSIDs []string `json:"ssids,omitempty"`
+	// Prefer attempts a configured SSID even when a different network
+	// currently has internet. Off by default so a working hotspot is not
+	// interrupted.
+	Prefer bool `json:"prefer,omitempty"`
+	// ResetOnStall power-cycles the interface after repeated failures.
+	ResetOnStall bool `json:"reset_on_stall,omitempty"`
 }
 
 var (
@@ -83,16 +123,21 @@ func defaultConfig() Config {
 			Min:     1,
 			Max:     defaultSuffixMax,
 		},
+		// New configs learn the portal SSID after the first successful login
+		// and can reconnect to it automatically. No secret is stored.
+		WiFi:        &WiFiConfig{Enabled: true},
 		PortalHosts: []string{"192.168.1.3"},
 		CheckURLs: []string{
 			"http://example.com/",
 			"http://connectivitycheck.gstatic.com/generate_204",
 			"http://captive.apple.com/hotspot-detect.html",
 		},
-		IntervalSeconds: 60,
-		RetryMinSeconds: 5,
-		RetryMaxSeconds: 60,
-		TimeoutSeconds:  8,
+		IntervalSeconds:    60,
+		RetryMinSeconds:    5,
+		RetryMaxSeconds:    60,
+		TimeoutSeconds:     8,
+		LoginAttempts:      defaultLoginAttempts,
+		LoginSettleSeconds: defaultLoginSettle,
 	}
 }
 
@@ -117,7 +162,16 @@ func (c *Config) applyDefaults() {
 	if c.TimeoutSeconds <= 0 {
 		c.TimeoutSeconds = d.TimeoutSeconds
 	}
+	// Zero means "unset" (JSON omits it); negative values are configuration
+	// errors and must not be silently replaced by a default.
+	if c.LoginAttempts == 0 {
+		c.LoginAttempts = d.LoginAttempts
+	}
+	if c.LoginSettleSeconds == 0 {
+		c.LoginSettleSeconds = d.LoginSettleSeconds
+	}
 	c.UsernameRotation.applyDefaults()
+	c.WiFi.applyDefaults()
 
 	for i, h := range c.PortalHosts {
 		h = strings.TrimSpace(h)
@@ -145,6 +199,27 @@ func (r *UsernameRotation) applyDefaults() {
 	}
 }
 
+func (w *WiFiConfig) applyDefaults() {
+	if w == nil {
+		return
+	}
+	w.Interface = strings.TrimSpace(w.Interface)
+	seen := make(map[string]bool, len(w.SSIDs))
+	out := w.SSIDs[:0]
+	for _, ssid := range w.SSIDs {
+		ssid = strings.TrimSpace(ssid)
+		if ssid == "" || seen[ssid] {
+			continue
+		}
+		seen[ssid] = true
+		out = append(out, ssid)
+	}
+	w.SSIDs = out
+	if w.Prefer {
+		w.Enabled = true
+	}
+}
+
 // rotatesUsername reports whether a username is generated per login.
 func (c *Config) rotatesUsername() bool {
 	return c.UsernameRotation != nil && c.UsernameRotation.Enabled
@@ -167,8 +242,17 @@ func (r *UsernameRotation) validate(username string) error {
 	if digits < 1 || digits > maxSuffixDigits {
 		return fmt.Errorf("username_rotation.digits must be between 1 and %d (got %d)", maxSuffixDigits, digits)
 	}
-	if strings.TrimSpace(username) != "" && !hasTrailingDigits(username, digits) {
-		return fmt.Errorf("username_rotation: username %q must end with at least %d digits", username, digits)
+	if strings.TrimSpace(username) == "" {
+		if !r.SuffixOnly {
+			return errors.New("username is empty; set username, or set username_rotation.suffix_only for generated usernames")
+		}
+	} else {
+		if r.SuffixOnly {
+			return errors.New("username_rotation.suffix_only is only valid when username is empty")
+		}
+		if !hasTrailingDigits(username, digits) {
+			return fmt.Errorf("username_rotation: username %q must end with at least %d digits", username, digits)
+		}
 	}
 	limit := pow10(digits)
 	if r.Min < 1 {
@@ -193,14 +277,28 @@ func (c *Config) validate() error {
 	if c.Password == "" {
 		return errors.New("password is empty")
 	}
+	if c.LoginAttempts < 1 || c.LoginAttempts > 10 {
+		return fmt.Errorf("login_attempts must be between 1 and 10 (got %d)", c.LoginAttempts)
+	}
+	if c.LoginSettleSeconds < 2 || c.LoginSettleSeconds > 30 {
+		return fmt.Errorf("login_settle_seconds must be between 2 and 30 (got %d)", c.LoginSettleSeconds)
+	}
 	if err := c.UsernameRotation.validate(c.Username); err != nil {
 		return err
 	}
 	if len(c.PortalHosts) == 0 {
 		return errors.New("portal_hosts is empty")
 	}
+	for _, h := range c.PortalHosts {
+		if strings.TrimSpace(h) == "" {
+			return errors.New("portal_hosts contains an empty entry")
+		}
+	}
 	if c.IntervalSeconds < 5 {
 		return fmt.Errorf("interval_seconds must be at least 5 (got %d)", c.IntervalSeconds)
+	}
+	if c.IntervalSeconds > 86400 {
+		return fmt.Errorf("interval_seconds must be at most 86400 (got %d)", c.IntervalSeconds)
 	}
 	if c.RetryMinSeconds < 2 {
 		return fmt.Errorf("retry_min_seconds must be at least 2 (got %d)", c.RetryMinSeconds)
@@ -238,6 +336,17 @@ func (c *Config) timeout() time.Duration {
 	return time.Duration(c.TimeoutSeconds) * time.Second
 }
 
+func (c *Config) loginSettle() time.Duration {
+	return time.Duration(c.LoginSettleSeconds) * time.Second
+}
+
+func (c *Config) loginAttempts() int {
+	if c.LoginAttempts < 1 {
+		return defaultLoginAttempts
+	}
+	return c.LoginAttempts
+}
+
 // configPath resolves the config location. An explicit --config always wins,
 // otherwise the OS-appropriate per-user config directory is used:
 //
@@ -259,7 +368,10 @@ func configPath() (string, error) {
 	return filepath.Join(dir, appName, "config.json"), nil
 }
 
-func loadConfig(path string) (*Config, error) {
+// readConfig parses a config without validating it, so commands can repair an
+// existing file (for example one with an empty username) by merging new flags
+// into it and saving the result.
+func readConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("%w: no config at %s (run `omada-autologin init`)", errNotConfigured, path)
@@ -272,10 +384,33 @@ func loadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	c.applyDefaults()
+	c.migrateLegacy()
+	return &c, nil
+}
+
+// migrateLegacy upgrades configs written before suffix-only usernames became
+// an explicit opt-in. Those configs stored an empty username with rotation
+// enabled, which meant "generate the whole username". Treating that as
+// username_rotation.suffix_only keeps an upgrade from breaking a working daemon;
+// new configs still have to pass --random-only.
+func (c *Config) migrateLegacy() {
+	if strings.TrimSpace(c.Username) != "" || c.UsernameRotation == nil {
+		return
+	}
+	if c.UsernameRotation.Enabled && !c.UsernameRotation.SuffixOnly {
+		c.UsernameRotation.SuffixOnly = true
+	}
+}
+
+func loadConfig(path string) (*Config, error) {
+	c, err := readConfig(path)
+	if err != nil {
+		return nil, err
+	}
 	if err := c.validate(); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	return &c, nil
+	return c, nil
 }
 
 func saveConfig(path string, c *Config) error {

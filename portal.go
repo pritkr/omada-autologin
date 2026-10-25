@@ -133,6 +133,39 @@ func numeric(s string) string {
 	return s
 }
 
+// withClientMAC returns a copy refreshed for the current interface MAC and
+// timestamp. Cached Omada entry URLs embed the client MAC (cid) and were often
+// issued for a previous private Wi-Fi address; reusing them makes the portal
+// reject the login with "invalid client".
+func (p *PortalContext) withClientMAC(mac string, now time.Time) *PortalContext {
+	if p == nil {
+		return nil
+	}
+	cp := *p
+	u, err := url.Parse(cp.PortalURL)
+	if err != nil {
+		return &cp
+	}
+	q := u.Query()
+	if mac != "" {
+		cp.ClientMAC = normalizeMAC(mac)
+		set := false
+		for _, key := range []string{"cid", "clientMac", "client_mac"} {
+			if q.Has(key) {
+				q.Set(key, cp.ClientMAC)
+				set = true
+			}
+		}
+		if !set {
+			q.Set("cid", cp.ClientMAC)
+		}
+	}
+	q.Set("t", strconv.FormatInt(now.Unix(), 10))
+	u.RawQuery = q.Encode()
+	cp.PortalURL = u.String()
+	return &cp
+}
+
 // contextFields returns the JSON fields shared by getPortalPageSetting and
 // the authentication endpoints.
 func (p *PortalContext) contextFields() map[string]any {
@@ -168,10 +201,25 @@ func newDiscoveryClient(timeout time.Duration) *http.Client {
 	}
 }
 
-func newPortalClient(timeout time.Duration) *http.Client {
+func newPortalClient(timeout time.Duration, allowedHosts []string) *http.Client {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	// Omada controllers ship a self-signed certificate. Portal hosts are
 	// allow-listed above; no other host ever receives credentials.
 	tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
-	return &http.Client{Timeout: timeout, Transport: tr}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: tr,
+		// A 307/308 replays the request body, so following a redirect blindly
+		// would forward the password to whatever host it names. Keep every hop
+		// inside portal_hosts.
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if !hostAllowed(req.URL, allowedHosts) {
+				return fmt.Errorf("portal redirected to %s, which is not in portal_hosts", req.URL.Host)
+			}
+			if len(via) >= 5 {
+				return errors.New("too many portal redirects")
+			}
+			return nil
+		},
+	}
 }

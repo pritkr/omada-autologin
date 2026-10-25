@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"syscall"
@@ -29,6 +30,12 @@ type app struct {
 	state     *stateStore
 	log       *Logger
 	usernames usernameRotator
+
+	// Network recovery bookkeeping for the daemon loop.
+	lastNetFP       string
+	lastNetMAC      string
+	lastWiFiAttempt time.Time
+	wifiFailures    int
 }
 
 type onceOptions struct {
@@ -81,6 +88,8 @@ func runCLI(args []string) int {
 		return cmdDiscover(rest)
 	case "randomize":
 		return cmdRandomize(rest)
+	case "wifi":
+		return cmdWiFi(rest)
 	case "install":
 		return cmdInstall(rest)
 	case "uninstall":
@@ -97,9 +106,11 @@ func printUsage(w *os.File) {
 
 Usage:
   %s                        set up and start (no parameters needed)
-  %s setup [--password P] [--host H] [--username U] [--interval SECONDS]
+  %s setup [--password P] [--host H] [--username U] [--random-only | --fixed]
+            [--portal-url URL] [--interval SECONDS] [--force]
+            [--no-login] [--no-service]
   %s init [--username U] [--password P] [--host H] [--force]
-            [--random-range 001-112 | --fixed]
+            [--random-range 001-112 | --fixed | --random-only]
             [--rotate-last N --rotate-min A --rotate-max B]
   %s once [--force] [--dry-run] [--url PORTAL_URL]
   %s login [--url PORTAL_URL] [--dry-run]
@@ -107,18 +118,23 @@ Usage:
   %s status [--json]
   %s discover
   %s randomize [--range 001-112 | --off]
+  %s wifi [status [--json] | scan | connect SSID [--force] | on | off |
+            add SSID | remove SSID] [--config PATH]
   %s install [--interval SECONDS]
   %s uninstall
   %s version
 
 Running with no arguments does everything: it creates the config if needed,
 checks the portal, then installs and starts the background daemon. setup is
-the explicit form of the same command. Pass --password (and optionally --host)
-for a fully non-interactive run.
+the explicit form of the same command. Pass --password and --username (or
+--random-only) for a fully non-interactive first run. On an existing config
+setup only changes the flags you pass, and asks for --force first so a
+credential is never replaced silently.
 
-New configs need no username: each login uses a random 3-digit username
-(001-112). Pass --username to keep a fixed prefix, or --fixed to disable
-rotation. Use randomize to change an existing config.
+New configs rotate the last three digits of the username (001-112) by
+default. setup and init ask for the username prefix; pass --random-only to
+use bare generated numbers instead. Pass --fixed to disable rotation, or
+--username to skip the prompt. Use randomize to change an existing config.
 
 Common flags:
   --config PATH   use a different config file
@@ -128,7 +144,7 @@ Config (created by setup or init):
   %s
 
 Docs: https://github.com/pritkr/omada-autologin
-`, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, configLocationHint())
+`, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, configLocationHint())
 }
 
 func configLocationHint() string {
@@ -147,9 +163,16 @@ func newFlagSet(name string) (*flag.FlagSet, *string, *bool) {
 	return fs, cfg, v
 }
 
+// finishFlags applies the global flags and rejects stray operands. Commands
+// differ in which flags they accept, but none of them takes positional
+// arguments apart from the wifi subcommands, which parse their own operands.
 func finishFlags(fs *flag.FlagSet, cfg *string, v *bool) bool {
 	flagConfig = *cfg
 	verbose = *v
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "unexpected argument %q\n", fs.Arg(0))
+		return false
+	}
 	return true
 }
 
@@ -189,22 +212,35 @@ func (a *app) close() {
 // portal once, then install and start the background daemon.
 func cmdSetup(args []string) int {
 	fs, cfgFlag, verboseFlag := newFlagSet("setup")
-	username := fs.String("username", "", "optional username prefix to rotate")
+	username := fs.String("username", "", "portal username / registration number (required unless --random-only)")
 	password := fs.String("password", "", "portal password")
 	host := fs.String("host", "", "portal host or IP (default 192.168.1.3)")
+	portalURL := fs.String("portal-url", "", "optional last-known-good portal entry URL")
 	interval := fs.Int("interval", 0, "seconds between checks")
-	force := fs.Bool("force", false, "rewrite an existing config")
+	randomOnly := fs.Bool("random-only", false, "send only the generated suffix as the username")
+	fixed := fs.Bool("fixed", false, "keep the username exactly as given (disable suffix rotation)")
+	force := fs.Bool("force", false, "apply changes to an existing config")
 	noLogin := fs.Bool("no-login", false, "skip the initial login test")
 	noService := fs.Bool("no-service", false, "configure and test, but do not install the daemon")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	finishFlags(fs, cfgFlag, verboseFlag)
+	if !finishFlags(fs, cfgFlag, verboseFlag) {
+		return 2
+	}
 	if !*noService {
 		if err := requireNonRoot(); err != nil {
 			return fail(err)
 		}
 	}
+	if *fixed && *randomOnly {
+		return fail(errors.New("--fixed cannot be combined with --random-only"))
+	}
+
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	changesConfig := set["username"] || set["password"] || set["host"] ||
+		set["portal-url"] || set["random-only"] || set["fixed"]
 
 	path, err := configPath()
 	if err != nil {
@@ -223,53 +259,182 @@ func cmdSetup(args []string) int {
 		return fail(fmt.Errorf("check config: %w", err))
 	}
 
-	if !configExists || *force {
+	if !configExists {
 		if *password == "" && !term.IsTerminal(int(os.Stdin.Fd())) {
 			return fail(errors.New("password is required: run in a terminal, or use `setup --password P` for non-interactive setup"))
 		}
 		initArgs := append([]string{}, child...)
-		// --force also skips init's optional prompts; there is nothing to
-		// overwrite when the config is missing.
+		// --force also skips init's optional portal-URL prompt; setup has an
+		// explicit --portal-url flag instead.
 		initArgs = append(initArgs, "--force")
-		if *password != "" {
+		if set["password"] {
 			initArgs = append(initArgs, "--password", *password)
 		}
-		if *username != "" {
+		if set["username"] {
 			initArgs = append(initArgs, "--username", *username)
 		}
-		h := strings.TrimSpace(*host)
-		if h == "" {
-			h = defaultConfig().PortalHosts[0]
+		if set["random-only"] {
+			initArgs = append(initArgs, "--random-only")
 		}
-		initArgs = append(initArgs, "--host", h)
+		if *fixed {
+			initArgs = append(initArgs, "--fixed")
+		}
+		if set["host"] {
+			h := strings.TrimSpace(*host)
+			if h == "" {
+				return fail(errors.New("--host cannot be empty"))
+			}
+			initArgs = append(initArgs, "--host", h)
+		}
+		if set["portal-url"] {
+			initArgs = append(initArgs, "--portal-url", *portalURL)
+		}
 		if code := cmdInitWithHints(initArgs, false); code != 0 {
 			return code
 		}
 	} else {
-		fmt.Printf("using existing config %s (pass --force to rewrite it)\n", path)
+		if changesConfig {
+			c, err := readConfig(path)
+			if err != nil {
+				return fail(err)
+			}
+			before := cloneConfig(c)
+			if err := applyConfigChanges(c, *username, *password, *host, *portalURL, *randomOnly, *fixed, set); err != nil {
+				return fail(err)
+			}
+			switch {
+			case reflect.DeepEqual(before, c):
+				// The same values were supplied again: this is a plain
+				// "apply and restart" run, not an overwrite.
+				fmt.Printf("using existing config %s\n", path)
+			case !*force:
+				return fail(fmt.Errorf("config already exists at %s; pass --force to change username, password, host, portal URL, or username rotation", path))
+			default:
+				if err := saveConfig(path, c); err != nil {
+					return fail(err)
+				}
+				fmt.Printf("updated %s\n", path)
+			}
+		} else {
+			fmt.Printf("using existing config %s\n", path)
+		}
 	}
 
+	if *interval > 0 {
+		c, err := readConfig(path)
+		if err != nil {
+			return fail(err)
+		}
+		c.IntervalSeconds = *interval
+		if err := saveConfig(path, c); err != nil {
+			return fail(err)
+		}
+	}
+
+	// Validate even when the check is skipped: setup must not report success
+	// for a config the daemon would refuse to load.
+	if _, err := loadConfig(path); err != nil {
+		return fail(err)
+	}
+
+	checkFailed := false
 	if !*noLogin {
 		fmt.Println("checking the portal...")
 		if code := cmdOnce("once", child); code != 0 {
-			fmt.Fprintln(os.Stderr, "warning: initial check failed; the daemon will retry in the background")
+			checkFailed = true
+			if *noService {
+				fmt.Fprintln(os.Stderr, "initial check failed; the config was saved, so fix the issue and retry with `status`")
+			} else {
+				fmt.Fprintln(os.Stderr, "warning: initial check failed; the daemon will retry in the background")
+			}
 		}
 	}
 
 	if *noService {
 		fmt.Println("service not installed (--no-service)")
+		if checkFailed {
+			return 1
+		}
 		return 0
 	}
 
-	installArgs := append([]string{}, child...)
-	if *interval > 0 {
-		installArgs = append(installArgs, "--interval", fmt.Sprintf("%d", *interval))
-	}
-	if code := cmdInstall(installArgs); code != 0 {
+	if code := cmdInstall(child); code != 0 {
 		return code
 	}
 	fmt.Printf("\nready: %s status\n", appName)
 	return 0
+}
+
+// cloneConfig copies a config deeply enough for change detection: the slices
+// and the rotation pointer are never shared with the original.
+func cloneConfig(c *Config) *Config {
+	out := *c
+	out.PortalHosts = append([]string(nil), c.PortalHosts...)
+	out.CheckURLs = append([]string(nil), c.CheckURLs...)
+	if c.UsernameRotation != nil {
+		r := *c.UsernameRotation
+		out.UsernameRotation = &r
+	}
+	if c.WiFi != nil {
+		w := *c.WiFi
+		w.SSIDs = append([]string(nil), c.WiFi.SSIDs...)
+		out.WiFi = &w
+	}
+	return &out
+}
+
+// applyConfigChanges merges only the flags the user supplied into c. Unrelated
+// fields (portal URL, Wi-Fi targets, retry tuning, check URLs) are preserved
+// instead of being reset to defaults. Validation happens before the caller
+// saves, so a rejected change leaves the file untouched.
+func applyConfigChanges(c *Config, username, password, host, portalURL string, randomOnly, fixed bool, set map[string]bool) error {
+	if set["username"] {
+		c.Username = strings.TrimSpace(username)
+		if c.Username == "" {
+			return errors.New("--username cannot be empty")
+		}
+	}
+	if set["password"] {
+		if password == "" {
+			return errors.New("--password cannot be empty")
+		}
+		c.Password = password
+	}
+	if set["host"] {
+		h := strings.TrimSpace(host)
+		if h == "" {
+			return errors.New("--host cannot be empty")
+		}
+		c.PortalHosts = []string{h}
+	}
+	if set["portal-url"] {
+		c.PortalURL = strings.TrimSpace(portalURL)
+	}
+	if randomOnly {
+		if strings.TrimSpace(username) != "" && set["username"] {
+			return errors.New("--random-only generates the whole username; remove --username")
+		}
+		c.Username = ""
+		if c.UsernameRotation == nil {
+			c.UsernameRotation = defaultConfig().UsernameRotation
+		}
+		c.UsernameRotation.Enabled = true
+		c.UsernameRotation.SuffixOnly = true
+	}
+	if fixed {
+		c.UsernameRotation = nil
+	}
+	if set["username"] && !randomOnly && c.UsernameRotation != nil {
+		// An explicit prefix means this is no longer a suffix-only login.
+		c.UsernameRotation.SuffixOnly = false
+	}
+	if !randomOnly && strings.TrimSpace(c.Username) != "" {
+		fixedHint := "--fixed"
+		if err := checkRotationUsername(c, fixedHint); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func cmdInit(args []string) int {
@@ -289,11 +454,14 @@ func cmdInitWithHints(args []string, hints bool) int {
 	rotateMax := fs.Int("rotate-max", 0, "largest randomized suffix, inclusive (default: 112 for 3 digits)")
 	randomRange := fs.String("random-range", "", "randomized suffix range, e.g. 001-112 (default)")
 	fixed := fs.Bool("fixed", false, "keep the username exactly as given (disable suffix rotation)")
+	randomOnly := fs.Bool("random-only", false, "generate bare usernames with no prefix (explicit opt-in)")
 	force := fs.Bool("force", false, "overwrite an existing config")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	finishFlags(fs, cfgFlag, verboseFlag)
+	if !finishFlags(fs, cfgFlag, verboseFlag) {
+		return 2
+	}
 
 	path, err := configPath()
 	if err != nil {
@@ -316,6 +484,10 @@ func cmdInitWithHints(args []string, hints bool) int {
 	switch {
 	case *fixed && (customRange || customRotate):
 		return fail(errors.New("--fixed cannot be combined with --rotate-last, --rotate-min, --rotate-max or --random-range"))
+	case *fixed && *randomOnly:
+		return fail(errors.New("--fixed cannot be combined with --random-only"))
+	case *randomOnly && strings.TrimSpace(*username) != "":
+		return fail(errors.New("--random-only generates the whole username; remove --username"))
 	case customRange && customRotate:
 		return fail(errors.New("use either --random-range or --rotate-last/--rotate-min/--rotate-max, not both"))
 	case *rotateLast < 0:
@@ -331,7 +503,7 @@ func cmdInitWithHints(args []string, hints bool) int {
 		if err != nil {
 			return fail(err)
 		}
-		c.UsernameRotation = &UsernameRotation{Enabled: true, Digits: digits, Min: min, Max: max}
+		c.UsernameRotation = &UsernameRotation{Enabled: true, Digits: digits, Min: min, Max: max, SuffixOnly: *randomOnly}
 	case *rotateLast > 0:
 		min := *rotateMin
 		if min == 0 {
@@ -341,16 +513,24 @@ func cmdInitWithHints(args []string, hints bool) int {
 		if max == 0 {
 			max = defaultSuffixMaxFor(*rotateLast)
 		}
-		c.UsernameRotation = &UsernameRotation{Enabled: true, Digits: *rotateLast, Min: min, Max: max}
+		c.UsernameRotation = &UsernameRotation{Enabled: true, Digits: *rotateLast, Min: min, Max: max, SuffixOnly: *randomOnly}
+	default:
+		if c.UsernameRotation == nil {
+			c.UsernameRotation = &UsernameRotation{Enabled: true, Digits: defaultSuffixDigits, Min: 1, Max: defaultSuffixMax}
+		}
+		c.UsernameRotation.SuffixOnly = *randomOnly
 	}
 
 	interactive := term.IsTerminal(int(os.Stdin.Fd()))
-	if interactive && c.Username == "" && !c.rotatesUsername() {
+	if interactive && c.Username == "" && !*randomOnly {
 		v, err := prompt("Username / registration number: ", false)
 		if err != nil {
 			return fail(err)
 		}
 		c.Username = strings.TrimSpace(v)
+	}
+	if strings.TrimSpace(c.Username) == "" && !*randomOnly {
+		return fail(errors.New("username is required; pass --username U, enable --random-only, or run in a terminal to be prompted"))
 	}
 	if strings.TrimSpace(c.Username) != "" {
 		if err := checkRotationUsername(&c, "--fixed"); err != nil {
@@ -392,7 +572,7 @@ func cmdInitWithHints(args []string, hints bool) int {
 		fmt.Printf("username rotation: %s\n", desc)
 	}
 	if c.Username == "" {
-		fmt.Println("username: generated from the rotated suffix")
+		fmt.Println("username: generated from the rotated suffix (explicit --random-only)")
 	}
 	if hints {
 		fmt.Printf("next: %s once --dry-run\n", appName)
@@ -441,7 +621,9 @@ func cmdOnce(name string, args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	finishFlags(fs, cfgFlag, verboseFlag)
+	if !finishFlags(fs, cfgFlag, verboseFlag) {
+		return 2
+	}
 
 	a, err := openApp()
 	if err != nil {
@@ -457,11 +639,17 @@ func cmdOnce(name string, args []string) int {
 }
 
 func (a *app) once(opts onceOptions) (checkOutcome, error) {
+	if !opts.dryRun && opts.url == "" {
+		// Recover the link before probing. On macOS the watcher is a poller,
+		// so this also handles a reassociation that happened between ticks.
+		a.maintainNetwork()
+	}
 	if opts.url != "" {
 		ctx, err := parsePortalURL(opts.url, a.cfg.PortalHosts)
 		if err != nil {
 			return checkOutcome{}, err
 		}
+		ctx = ctx.withClientMAC(currentClientMAC(a.cfg), time.Now())
 		if !opts.force && !opts.dryRun {
 			if res := probe(a.cfg, a.cfg.timeout()); res.Online {
 				a.log.Printf("already online; nothing to do (use --force to test a login)")
@@ -508,17 +696,45 @@ func (a *app) once(opts onceOptions) (checkOutcome, error) {
 		fmt.Println("online: yes (nothing to log in to)")
 		return checkOutcome{Online: true}, nil
 	default:
-		ctx = a.cachedPortal()
-		if ctx == nil {
-			if res.FoundURL != "" {
-				return checkOutcome{}, fmt.Errorf("captive portal found at %s but it is not an allowed Omada entry URL", res.FoundURL)
+		// A cached redirect can be answered from the gateway's cache for a
+		// previous client MAC. Retry once with a unique query string before
+		// falling back to the remembered entry URL.
+		fresh := probeFresh(a.cfg, a.cfg.timeout())
+		switch {
+		case fresh.Context != nil:
+			ctx = fresh.Context
+			a.log.Printf("found a fresh portal URL after a cache-busted probe")
+		case fresh.Online:
+			fmt.Println("online: yes (nothing to log in to)")
+			return checkOutcome{Online: true}, nil
+		default:
+			if fresh.Detail != "" {
+				res.Detail = fresh.Detail
 			}
-			if res.Detail != "" {
-				return checkOutcome{}, fmt.Errorf("not online and no portal URL: %s", res.Detail)
-			}
-			return checkOutcome{}, errors.New("not online and no captive portal redirect was found")
 		}
-		a.log.Printf("no portal redirect parsed; using cached portal URL")
+		if ctx == nil && a.wifiEnabled() && a.ensureWiFi("portal not reachable", true) {
+			// The link moved to a target network; give it one fresh probe
+			// before falling back to a URL learned on the previous network.
+			if again := probe(a.cfg, a.cfg.timeout()); again.Context != nil {
+				ctx = again.Context
+			} else if again.Online {
+				fmt.Println("online: yes (nothing to log in to)")
+				return checkOutcome{Online: true}, nil
+			}
+		}
+		if ctx == nil {
+			ctx = a.cachedPortal()
+			if ctx == nil {
+				if res.FoundURL != "" {
+					return checkOutcome{}, fmt.Errorf("captive portal found at %s but it is not an allowed Omada entry URL", res.FoundURL)
+				}
+				if res.Detail != "" {
+					return checkOutcome{}, fmt.Errorf("not online and no portal URL: %s", res.Detail)
+				}
+				return checkOutcome{}, errors.New("not online and no captive portal redirect was found")
+			}
+			a.log.Printf("no portal redirect parsed; using cached portal URL refreshed for client %s", ctx.ClientMAC)
+		}
 	}
 
 	attempted, err := a.attempt(ctx, opts)
@@ -534,8 +750,17 @@ func (a *app) once(opts onceOptions) (checkOutcome, error) {
 	return checkOutcome{Online: true, Attempted: true, LoggedIn: true}, nil
 }
 
+// cachedPortal returns the freshest remembered entry URL, updated for the
+// current client MAC and current timestamp. Omada ties an entry URL to the
+// client that received it, and macOS rotates private Wi-Fi addresses, so the
+// stored cid is often stale by the time it is needed.
 func (a *app) cachedPortal() *PortalContext {
-	for _, raw := range []string{a.cfg.PortalURL, a.state.load().LastPortalURL} {
+	mac := currentClientMAC(a.cfg)
+	current := ""
+	if a.wifiEnabled() {
+		current = wifiCurrentSSID(wifiInterface(a.cfg))
+	}
+	for _, raw := range []string{a.state.load().LastPortalURL, a.cfg.PortalURL} {
 		if strings.TrimSpace(raw) == "" {
 			continue
 		}
@@ -544,8 +769,33 @@ func (a *app) cachedPortal() *PortalContext {
 			a.log.Printf("cached portal URL rejected: %v", err)
 			continue
 		}
+		// An entry URL carries the ssid/ap it was issued for. Reusing it on a
+		// different network would log in against stale details and record the
+		// wrong SSID, so wait for a fresh redirect instead.
+		if current != "" && ctx.SSID != "" && !sameSSID(current, ctx.SSID) {
+			a.log.Printf("cached portal URL is for %q, not the current %q; ignoring it", ctx.SSID, current)
+			continue
+		}
+		return ctx.withClientMAC(mac, time.Now())
+	}
+	return nil
+}
+
+// refreshPortal re-discovers the entry URL after the portal rejects the client
+// id, then falls back to the cached URL refreshed for the current MAC.
+func (a *app) refreshPortal(fallback *PortalContext) *PortalContext {
+	mac := currentClientMAC(a.cfg)
+	if res := probeFresh(a.cfg, a.cfg.timeout()); res.Context != nil {
+		a.log.Printf("portal: refreshed entry URL for client %s", mac)
+		return res.Context.withClientMAC(mac, time.Now())
+	}
+	if fallback != nil {
+		return fallback.withClientMAC(mac, time.Now())
+	}
+	if ctx := a.cachedPortal(); ctx != nil {
 		return ctx
 	}
+	a.state.clearPortalURL()
 	return nil
 }
 
@@ -569,20 +819,71 @@ func (a *app) attempt(ctx *PortalContext, opts onceOptions) (bool, error) {
 	}
 	defer lk.release()
 
-	username, err := a.usernames.next(a.cfg)
-	if err != nil {
-		return false, err
-	}
-	err = doLoginAs(a.cfg, ctx, username, opts.dryRun, a.log)
+	// Always log in with the MAC currently on the wire; the ap/ssid fields in
+	// a cached URL are still the best information available for this network.
+	ctx = ctx.withClientMAC(currentClientMAC(a.cfg), time.Now())
+
+	attempts := a.cfg.loginAttempts()
 	if opts.dryRun {
-		return true, err
+		attempts = 1
 	}
-	if err != nil {
-		a.state.recordFailure(err.Error())
-		return true, err
+	attempted := false
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		username, err := a.usernames.next(a.cfg)
+		if err != nil {
+			return attempted, err
+		}
+		if i > 0 {
+			// Give the controller a moment to release the previous attempt.
+			time.Sleep(time.Duration(i) * time.Second)
+		}
+		attempted = true
+		err = doLoginAs(a.cfg, ctx, username, opts.dryRun, a.log)
+		if err == nil {
+			if opts.dryRun {
+				return true, nil
+			}
+			a.state.recordSuccess(ctx.PortalURL, a.ssidForState(ctx))
+			return true, nil
+		}
+		lastErr = err
+		if opts.dryRun {
+			return true, err
+		}
+		a.log.Printf("attempt %d/%d failed: %v", i+1, attempts, err)
+		if !isRetryableLoginError(err) {
+			break
+		}
+		if shouldRefreshPortal(err) {
+			if next := a.refreshPortal(ctx); next != nil {
+				ctx = next
+			} else {
+				break
+			}
+		}
 	}
-	a.state.recordSuccess(ctx.PortalURL)
-	return true, nil
+	if lastErr != nil {
+		a.state.recordFailure(lastErr.Error())
+	}
+	if attempted && !opts.dryRun && isReachabilityError(lastErr) {
+		// A dead link is not a credential problem; try to bring Wi-Fi back
+		// before the next check instead of waiting for the full backoff.
+		a.ensureWiFi("portal unreachable", true)
+	}
+	return attempted, lastErr
+}
+
+// ssidForState prefers the SSID the portal reported, falling back to the
+// network the OS says we are on when it can be read.
+func (a *app) ssidForState(ctx *PortalContext) string {
+	if ctx != nil && strings.TrimSpace(ctx.SSID) != "" {
+		return strings.TrimSpace(ctx.SSID)
+	}
+	if !a.wifiEnabled() {
+		return ""
+	}
+	return wifiCurrentSSID(wifiInterface(a.cfg))
 }
 
 func cmdRun(args []string) int {
@@ -591,7 +892,9 @@ func cmdRun(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	finishFlags(fs, cfgFlag, verboseFlag)
+	if !finishFlags(fs, cfgFlag, verboseFlag) {
+		return 2
+	}
 
 	a, err := openApp()
 	if err != nil {
@@ -606,8 +909,8 @@ func cmdRun(args []string) int {
 	}
 
 	// On Linux this wakes immediately when NetworkManager changes the link or
-	// an address, so a reconnect is handled in about a second. Elsewhere it
-	// is a no-op and the normal interval is the only trigger.
+	// an address. macOS and Windows poll a cheap fingerprint every 2 seconds.
+	// Other platforms fall back to the normal interval.
 	wake := make(chan struct{}, 1)
 	stopWatch := watchNetwork(wake)
 	defer stopWatch()
@@ -620,7 +923,12 @@ func cmdRun(args []string) int {
 	fmt.Printf("%s running (online check every %ds, instant on network change)\n", appName, a.cfg.IntervalSeconds)
 
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	reload := reloadSignal()
+	notify := []os.Signal{os.Interrupt, syscall.SIGTERM}
+	if reload != nil {
+		notify = append(notify, reload)
+	}
+	signal.Notify(sig, notify...)
 	defer signal.Stop(sig)
 
 	retry := a.cfg.retryMin()
@@ -650,7 +958,7 @@ func cmdRun(args []string) int {
 				a.log.Printf("network change detected; checking now")
 				break wait
 			case s := <-sig:
-				if s == syscall.SIGHUP {
+				if reload != nil && s == reload {
 					if err := a.reload(*interval); err != nil {
 						a.log.Printf("reload failed: %v", err)
 					} else {
@@ -721,6 +1029,13 @@ type statusReport struct {
 	LogPath          string `json:"log_path"`
 	FailCount        int    `json:"fail_count"`
 	LastError        string `json:"last_error,omitempty"`
+	SSID             string `json:"ssid,omitempty"`
+	Interface        string `json:"interface,omitempty"`
+	IPv4             string `json:"ipv4,omitempty"`
+	Gateway          string `json:"gateway,omitempty"`
+	MAC              string `json:"mac,omitempty"`
+	WiFiEnabled      bool   `json:"wifi_enabled"`
+	LastSSID         string `json:"last_ssid,omitempty"`
 }
 
 func cmdStatus(args []string) int {
@@ -729,7 +1044,9 @@ func cmdStatus(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	finishFlags(fs, cfgFlag, verboseFlag)
+	if !finishFlags(fs, cfgFlag, verboseFlag) {
+		return 2
+	}
 
 	a, err := openApp()
 	if err != nil {
@@ -739,6 +1056,7 @@ func cmdStatus(args []string) int {
 
 	res := probe(a.cfg, a.cfg.timeout())
 	st := a.state.load()
+	net := currentWiFiStatusWithSSID(a.cfg)
 	report := statusReport{
 		Online:           res.Online,
 		Username:         a.cfg.Username,
@@ -748,6 +1066,13 @@ func cmdStatus(args []string) int {
 		LogPath:          a.log.Path(),
 		FailCount:        st.FailCount,
 		LastError:        st.LastError,
+		SSID:             net.SSID,
+		Interface:        net.Interface,
+		IPv4:             net.IPv4,
+		Gateway:          net.Gateway,
+		MAC:              net.MAC,
+		WiFiEnabled:      a.wifiEnabled(),
+		LastSSID:         st.LastSSID,
 	}
 	if res.Context != nil {
 		report.PortalURL = res.Context.PortalURL
@@ -772,6 +1097,12 @@ func cmdStatus(args []string) int {
 	} else {
 		fmt.Println("portal: not found")
 	}
+	if report.SSID != "" || report.Interface != "" {
+		fmt.Printf("wifi:   %s (%s)\n", orUnknown(report.SSID), orUnknown(report.Interface))
+	}
+	if report.WiFiEnabled {
+		fmt.Println("recover: on")
+	}
 	user := report.Username
 	if user == "" {
 		user = "(generated)"
@@ -793,7 +1124,9 @@ func cmdDiscover(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	finishFlags(fs, cfgFlag, verboseFlag)
+	if !finishFlags(fs, cfgFlag, verboseFlag) {
+		return 2
+	}
 
 	a, err := openApp()
 	if err != nil {
@@ -828,7 +1161,9 @@ func cmdRandomize(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	finishFlags(fs, cfgFlag, verboseFlag)
+	if !finishFlags(fs, cfgFlag, verboseFlag) {
+		return 2
+	}
 
 	if *off && strings.TrimSpace(*rangeFlag) != "" {
 		fmt.Fprintln(os.Stderr, "use either --range or --off, not both")
@@ -859,7 +1194,13 @@ func cmdRandomize(args []string) int {
 		if err != nil {
 			return fail(err)
 		}
-		a.cfg.UsernameRotation = &UsernameRotation{Enabled: true, Digits: digits, Min: min, Max: max}
+		a.cfg.UsernameRotation = &UsernameRotation{
+			Enabled:    true,
+			Digits:     digits,
+			Min:        min,
+			Max:        max,
+			SuffixOnly: strings.TrimSpace(a.cfg.Username) == "",
+		}
 		if err := checkRotationUsername(a.cfg, "--off"); err != nil {
 			return fail(err)
 		}
@@ -885,7 +1226,9 @@ func cmdInstall(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	finishFlags(fs, cfgFlag, verboseFlag)
+	if !finishFlags(fs, cfgFlag, verboseFlag) {
+		return 2
+	}
 
 	a, err := openApp()
 	if err != nil {
@@ -958,7 +1301,9 @@ func cmdUninstall(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	finishFlags(fs, cfgFlag, verboseFlag)
+	if !finishFlags(fs, cfgFlag, verboseFlag) {
+		return 2
+	}
 
 	if err := uninstallService(); err != nil {
 		return fail(err)

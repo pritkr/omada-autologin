@@ -10,8 +10,8 @@
 #   --version TAG   install a specific release (default: latest)
 #
 # Non-interactive config:
-#   OMADA_PASSWORD=... OMADA_HOST=192.168.1.3 ... | sh
-#   (OMADA_USERNAME is optional; only needed when usernames share a prefix.)
+#   OMADA_PASSWORD=... OMADA_USERNAME=24105157001 OMADA_HOST=192.168.1.3 ... | sh
+#   (OMADA_USERNAME is required unless OMADA_RANDOM_ONLY=1 is set explicitly.)
 set -eu
 
 REPO="${OMADA_REPO:-pritkr/omada-autologin}"
@@ -38,6 +38,7 @@ Usage: install.sh [options]
 
 Environment for unattended setup:
   OMADA_USERNAME, OMADA_PASSWORD, OMADA_HOST
+  OMADA_RANDOM_ONLY=1  explicitly send bare generated suffixes as usernames
 EOF
 }
 
@@ -150,10 +151,20 @@ if "$BIN_PATH" status >/dev/null 2>&1; then
 	configured=1
 	say "existing config found; keeping it"
 elif [ -n "${OMADA_PASSWORD:-}" ]; then
+	if [ -z "${OMADA_USERNAME:-}" ] && [ "${OMADA_RANDOM_ONLY:-0}" != 1 ] && [ "$have_tty" != 1 ]; then
+		die "OMADA_USERNAME is required for unattended setup (or set OMADA_RANDOM_ONLY=1 to send bare generated suffixes)"
+	fi
 	set -- --password "$OMADA_PASSWORD"
 	[ -n "${OMADA_HOST:-}" ] && set -- "$@" --host "$OMADA_HOST"
 	[ -n "${OMADA_USERNAME:-}" ] && set -- "$@" --username "$OMADA_USERNAME"
-	"$BIN_PATH" init "$@"
+	[ "${OMADA_RANDOM_ONLY:-0}" = 1 ] && set -- "$@" --random-only
+	if [ "$have_tty" = 1 ]; then
+		# The curl|sh pipeline's stdin is the exhausted pipe, so prompts
+		# must read the controlling terminal explicitly.
+		"$BIN_PATH" init "$@" </dev/tty
+	else
+		"$BIN_PATH" init "$@"
+	fi
 	configured=1
 elif [ "$have_tty" = 1 ]; then
 	"$BIN_PATH" init </dev/tty

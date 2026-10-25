@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -84,6 +85,28 @@ func probe(cfg *Config, timeout time.Duration) probeResult {
 		}
 	}
 	return res
+}
+
+// probeFresh repeats the captive check with a unique query parameter so a
+// gateway or local cache cannot answer with the previous probe's result. This
+// is used when a cached portal URL has gone stale (for example after macOS
+// rotated the private Wi-Fi MAC).
+func probeFresh(cfg *Config, timeout time.Duration) probeResult {
+	c := *cfg
+	c.CheckURLs = make([]string, 0, len(cfg.CheckURLs))
+	buster := strconv.FormatInt(time.Now().UnixNano(), 36)
+	for _, raw := range cfg.CheckURLs {
+		u, err := url.Parse(raw)
+		if err != nil {
+			c.CheckURLs = append(c.CheckURLs, raw)
+			continue
+		}
+		q := u.Query()
+		q.Set("_omada", buster)
+		u.RawQuery = q.Encode()
+		c.CheckURLs = append(c.CheckURLs, u.String())
+	}
+	return probe(&c, timeout)
 }
 
 // responseIsOnline is deliberately conservative. A login page served with

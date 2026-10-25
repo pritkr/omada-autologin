@@ -140,9 +140,10 @@ func TestUsernameRotatorWithoutBase(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.Username = ""
 	cfg.Password = "test-pass"
+	cfg.UsernameRotation.SuffixOnly = true
 	cfg.applyDefaults()
 	if err := cfg.validate(); err != nil {
-		t.Fatalf("empty username with rotation should validate: %v", err)
+		t.Fatalf("empty username with explicit suffix_only should validate: %v", err)
 	}
 
 	var rot usernameRotator

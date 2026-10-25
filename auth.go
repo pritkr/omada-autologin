@@ -129,6 +129,33 @@ type loginResult struct {
 	Raw        string
 }
 
+// loginError marks a failure that is worth retrying in the same check. The
+// wrapped error keeps the existing user-facing message.
+type loginError struct {
+	err           error
+	refreshPortal bool
+}
+
+func (e *loginError) Error() string { return e.err.Error() }
+func (e *loginError) Unwrap() error { return e.err }
+
+func markRetryable(err error, refreshPortal bool) error {
+	if err == nil {
+		return nil
+	}
+	return &loginError{err: err, refreshPortal: refreshPortal}
+}
+
+func isRetryableLoginError(err error) bool {
+	var e *loginError
+	return errors.As(err, &e)
+}
+
+func shouldRefreshPortal(err error) bool {
+	var e *loginError
+	return errors.As(err, &e) && e.refreshPortal
+}
+
 // doLogin performs one portal authentication attempt. It is used by tests and
 // by one-off callers; the daemon passes a username from its rotator instead.
 func doLogin(cfg *Config, ctx *PortalContext, dryRun bool, log *Logger) error {
@@ -146,20 +173,21 @@ func doLoginAs(cfg *Config, ctx *PortalContext, username string, dryRun bool, lo
 	if err := ctx.validate(cfg.PortalHosts); err != nil {
 		return err
 	}
-	client := newPortalClient(cfg.timeout())
+	client := newPortalClient(cfg.timeout(), cfg.PortalHosts)
 	defer client.CloseIdleConnections()
 
 	settingURL := ctx.Origin + "/portal/getPortalPageSetting"
 	status, body, err := postJSON(client, settingURL, ctx, ctx.contextFields())
 	if err != nil {
-		return fmt.Errorf("getPortalPageSetting: %w", err)
+		return markRetryable(fmt.Errorf("getPortalPageSetting: %w", err), false)
 	}
 	var setting portalSetting
 	if err := json.Unmarshal(body, &setting); err != nil {
-		return fmt.Errorf("getPortalPageSetting returned HTTP %d and invalid JSON: %w", status, err)
+		return markRetryable(fmt.Errorf("getPortalPageSetting returned HTTP %d and invalid JSON: %w", status, err), false)
 	}
 	if setting.ErrorCode != nil && int(*setting.ErrorCode) != 0 {
-		return fmt.Errorf("getPortalPageSetting: errorCode %d: %s", int(*setting.ErrorCode), setting.Msg)
+		code := int(*setting.ErrorCode)
+		return markRetryable(fmt.Errorf("getPortalPageSetting: errorCode %d: %s", code, setting.Msg), code == -41526)
 	}
 	var result settingResult
 	if len(setting.Result) > 0 {
@@ -200,21 +228,21 @@ func doLoginAs(cfg *Config, ctx *PortalContext, username string, dryRun bool, lo
 	res, err := sendAuth(client, ctx, method, payload)
 	if err != nil {
 		log.Printf("login request failed: %v", err)
-		return err
+		return markRetryable(err, false)
 	}
 	success := res.ErrorCode != nil && *res.ErrorCode == 0
 	if res.ErrorCode == nil && strings.EqualFold(strings.TrimSpace(res.Message), "success.") {
 		success = true
 	}
 	if success {
-		if waitOnline(cfg, 3*time.Second) {
+		if waitOnline(cfg, cfg.loginSettle()) {
 			log.Printf("login ok: %s @ %q (authType %d, client %s)", sentUsername, ctx.SSID, method.AuthType, ctx.ClientMAC)
 			return nil
 		}
 		msg := fmt.Sprintf("login accepted but internet not confirmed: %s @ %q (authType %d)", sentUsername, ctx.SSID, method.AuthType)
 		log.Printf("%s", msg)
 		log.Printf("  if this repeats, the account may have hit its data/time quota; it will retry after the portal resets")
-		return fmt.Errorf("%s", msg)
+		return markRetryable(fmt.Errorf("%s", msg), false)
 	}
 
 	code := "?"
@@ -223,15 +251,18 @@ func doLoginAs(cfg *Config, ctx *PortalContext, username string, dryRun bool, lo
 	}
 	log.Printf("login failed: user=%s http=%d errorCode=%s msg=%q (authType %d, client %s)",
 		sentUsername, res.HTTPStatus, code, res.Message, method.AuthType, ctx.ClientMAC)
+	err = fmt.Errorf("login rejected: errorCode %s: %s", code, res.Message)
 	switch {
 	case res.ErrorCode != nil && *res.ErrorCode == -41525:
 		log.Printf("  -> portal says wrong password")
 	case res.ErrorCode != nil && *res.ErrorCode == -41526:
-		log.Printf("  -> portal says invalid client; toggle Wi-Fi off/on so a fresh portal URL is issued")
+		log.Printf("  -> portal says invalid client; refreshing the portal URL for the current MAC")
+		return markRetryable(err, true)
 	case res.ErrorCode != nil && *res.ErrorCode == -41527:
-		log.Printf("  -> portal says invalid local user %q; create it or narrow username_rotation", sentUsername)
+		log.Printf("  -> portal says invalid local user %q; trying another suffix", sentUsername)
+		return markRetryable(err, false)
 	}
-	return fmt.Errorf("login rejected: errorCode %s: %s", code, res.Message)
+	return err
 }
 
 func sendAuth(client *http.Client, ctx *PortalContext, method authMethod, payload map[string]any) (loginResult, error) {

@@ -197,7 +197,7 @@ func TestSetupCreatesConfigWithoutService(t *testing.T) {
 	}()
 
 	path := filepath.Join(t.TempDir(), "config.json")
-	args := []string{"setup", "--config", path, "--password", "test-pass", "--no-login", "--no-service"}
+	args := []string{"setup", "--config", path, "--password", "test-pass", "--random-only", "--no-login", "--no-service"}
 	if code := runCLI(args); code != 0 {
 		t.Fatalf("setup exit = %d", code)
 	}
@@ -211,6 +211,9 @@ func TestSetupCreatesConfigWithoutService(t *testing.T) {
 	if !cfg.rotatesUsername() {
 		t.Fatal("rotation should be enabled by default")
 	}
+	if !cfg.UsernameRotation.SuffixOnly {
+		t.Fatal("--random-only should be explicit in the config")
+	}
 	if len(cfg.PortalHosts) != 1 || cfg.PortalHosts[0] != "192.168.1.3" {
 		t.Fatalf("portal hosts = %v", cfg.PortalHosts)
 	}
@@ -218,6 +221,137 @@ func TestSetupCreatesConfigWithoutService(t *testing.T) {
 	// Re-running setup must reuse the existing config.
 	if code := runCLI(args); code != 0 {
 		t.Fatalf("second setup exit = %d", code)
+	}
+}
+
+func TestSetupRequiresUsernameUnlessRandomOnly(t *testing.T) {
+	defer func() {
+		flagConfig = ""
+		verbose = false
+	}()
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	args := []string{"setup", "--config", path, "--password", "test-pass", "--no-login", "--no-service"}
+	if code := runCLI(args); code == 0 {
+		t.Fatal("setup without a username should fail outside a terminal")
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("config should not exist after a failed setup: %v", err)
+	}
+}
+
+func TestSetupRequiresForceToChangeExistingConfig(t *testing.T) {
+	defer func() {
+		flagConfig = ""
+		verbose = false
+	}()
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	base := []string{"setup", "--config", path, "--username", "24105157001", "--password", "first-pass", "--no-login", "--no-service"}
+	if code := runCLI(base); code != 0 {
+		t.Fatalf("setup exit = %d", code)
+	}
+
+	changed := []string{"setup", "--config", path, "--username", "24105157001", "--password", "second-pass", "--no-login", "--no-service"}
+	if code := runCLI(changed); code == 0 {
+		t.Fatal("changing the password without --force should fail")
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Password != "first-pass" {
+		t.Fatalf("config changed without --force: password = %q", cfg.Password)
+	}
+
+	if code := runCLI(append(changed, "--force")); code != 0 {
+		t.Fatalf("setup --force exit = %d", code)
+	}
+	cfg, err = loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Password != "second-pass" {
+		t.Fatalf("password = %q after --force", cfg.Password)
+	}
+}
+
+func TestSetupValidatesConfigWhenLoginIsSkipped(t *testing.T) {
+	defer func() {
+		flagConfig = ""
+		verbose = false
+	}()
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	invalid := `{"username":"24105157001","password":"test-pass","login_attempts":99}`
+	if err := os.WriteFile(path, []byte(invalid), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"setup", "--config", path, "--no-login", "--no-service"}
+	if code := runCLI(args); code == 0 {
+		t.Fatal("setup --no-login reported success for an invalid config")
+	}
+}
+
+func TestLegacyEmptyUsernameConfigStillLoads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	legacy := `{"password":"test-pass","username_rotation":{"enabled":true,"digits":3,"min":1,"max":112}}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("legacy config should still load: %v", err)
+	}
+	if cfg.UsernameRotation == nil || !cfg.UsernameRotation.SuffixOnly {
+		t.Fatal("legacy empty username should migrate to suffix-only")
+	}
+	username, err := new(usernameRotator).next(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(username) != 3 {
+		t.Fatalf("generated username = %q, want a bare 3-digit suffix", username)
+	}
+	n, err := strconv.Atoi(username)
+	if err != nil || n < 1 || n > 112 {
+		t.Fatalf("generated username %q is outside the configured range", username)
+	}
+
+	// A save must persist the migration instead of rewriting the old shape.
+	if err := saveConfig(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"suffix_only": true`) {
+		t.Fatalf("migration was not persisted:\n%s", data)
+	}
+}
+
+func TestInitKeepsUsernameWhenRotating(t *testing.T) {
+	defer func() {
+		flagConfig = ""
+		verbose = false
+	}()
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	args := []string{"init", "--config", path, "--password", "test-pass", "--username", "24105157001"}
+	if code := runCLI(args); code != 0 {
+		t.Fatalf("init exit = %d", code)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Username != "24105157001" {
+		t.Fatalf("username = %q", cfg.Username)
+	}
+	if cfg.UsernameRotation == nil || cfg.UsernameRotation.SuffixOnly {
+		t.Fatalf("expected prefixed rotation, got %+v", cfg.UsernameRotation)
 	}
 }
 
