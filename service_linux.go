@@ -11,7 +11,7 @@ import (
 
 const (
 	serviceLabel = "omada-autologin"
-	timerLabel   = serviceLabel + ".timer"
+	timerLabel   = serviceLabel + ".timer" // removed from older installs
 )
 
 func installService(spec serviceSpec) error {
@@ -29,52 +29,25 @@ func installService(spec serviceSpec) error {
 
 	execStart := strings.Join([]string{
 		systemdQuote(spec.Executable),
-		"once",
+		"run",
 		"--config",
 		systemdQuote(spec.ConfigPath),
 	}, " ")
 
-	service := fmt.Sprintf(`[Unit]
-Description=%s
-After=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=%s
-Nice=10
-`, spec.Description, execStart)
-
-	interval := int(spec.Interval.Seconds())
-	if interval < 5 {
-		interval = 5
-	}
-	timer := fmt.Sprintf(`[Unit]
-Description=%s (timer)
-
-[Timer]
-OnBootSec=%ds
-OnUnitActiveSec=%ds
-AccuracySec=1s
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-`, spec.Description, interval, interval)
-
+	service := linuxServiceUnit(spec, execStart)
 	servicePath := filepath.Join(unitDir, serviceLabel+".service")
-	timerPath := filepath.Join(unitDir, timerLabel)
+	// Migrate away from the timer-based installer used by v0.1.x.
+	_ = runCommand("systemctl", "--user", "disable", "--now", timerLabel)
+	_ = os.Remove(filepath.Join(unitDir, timerLabel))
 	if err := os.WriteFile(servicePath, []byte(service), 0o600); err != nil {
 		return fmt.Errorf("write systemd service: %w", err)
 	}
-	if err := os.WriteFile(timerPath, []byte(timer), 0o600); err != nil {
-		return fmt.Errorf("write systemd timer: %w", err)
-	}
 
 	if err := runCommand("systemctl", "--user", "daemon-reload"); err != nil {
-		return fmt.Errorf("systemd user session is not available: %w", err)
+		return fmt.Errorf("systemd user session is not available (Hyprland needs a systemd user session, or use `omada-autologin run`): %w", err)
 	}
-	if err := runCommand("systemctl", "--user", "enable", "--now", timerLabel); err != nil {
-		return fmt.Errorf("enable systemd timer: %w", err)
+	if err := runCommand("systemctl", "--user", "enable", "--now", serviceLabel+".service"); err != nil {
+		return fmt.Errorf("enable systemd service: %w", err)
 	}
 	return nil
 }
@@ -88,6 +61,7 @@ func uninstallService() error {
 		return err
 	}
 	unitDir := filepath.Join(base, "systemd", "user")
+	_ = runCommand("systemctl", "--user", "disable", "--now", serviceLabel+".service")
 	_ = runCommand("systemctl", "--user", "disable", "--now", timerLabel)
 	for _, name := range []string{serviceLabel + ".service", timerLabel} {
 		path := filepath.Join(unitDir, name)
@@ -97,4 +71,25 @@ func uninstallService() error {
 	}
 	_ = runCommand("systemctl", "--user", "daemon-reload")
 	return nil
+}
+
+func linuxServiceUnit(spec serviceSpec, execStart string) string {
+	return fmt.Sprintf(`[Unit]
+Description=%s
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%s
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
+`, spec.Description, execStart)
 }

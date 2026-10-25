@@ -87,6 +87,18 @@ func (s *stateStore) inBackoff() bool {
 	return time.Since(time.Unix(st.LastAttempt, 0)) < cooldown
 }
 
+// clearFailures drops the long cooldown after a network change. Failures from
+// the previous network (wrong portal, stale client MAC, no DHCP) should not
+// delay the first login attempt on the new one.
+func (s *stateStore) clearFailures() {
+	st := s.load()
+	if st.FailCount == 0 {
+		return
+	}
+	st.FailCount = 0
+	_ = s.save(st)
+}
+
 // lock is a portable best-effort inter-process lock. A stale lock older than
 // lockStaleAfter is removed, so a crashed run cannot block the scheduler.
 type lock struct {

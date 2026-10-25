@@ -29,8 +29,17 @@ type Config struct {
 	// CheckURLs are plain-HTTP URLs used to detect a captive portal.
 	CheckURLs []string `json:"check_urls,omitempty"`
 
+	// IntervalSeconds is the normal (online) health-check interval. The
+	// daemon reacts immediately to link/address changes on Linux, so this
+	// only needs to be a low-frequency safety net.
 	IntervalSeconds int `json:"interval_seconds,omitempty"`
-	TimeoutSeconds  int `json:"timeout_seconds,omitempty"`
+
+	// RetryMinSeconds/RetryMaxSeconds bound the exponential backoff used
+	// while the network is offline or the portal rejects a login.
+	RetryMinSeconds int `json:"retry_min_seconds,omitempty"`
+	RetryMaxSeconds int `json:"retry_max_seconds,omitempty"`
+
+	TimeoutSeconds int `json:"timeout_seconds,omitempty"`
 }
 
 var (
@@ -47,7 +56,9 @@ func defaultConfig() Config {
 			"http://connectivitycheck.gstatic.com/generate_204",
 			"http://captive.apple.com/hotspot-detect.html",
 		},
-		IntervalSeconds: 15,
+		IntervalSeconds: 60,
+		RetryMinSeconds: 5,
+		RetryMaxSeconds: 60,
 		TimeoutSeconds:  8,
 	}
 }
@@ -62,6 +73,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.IntervalSeconds <= 0 {
 		c.IntervalSeconds = d.IntervalSeconds
+	}
+	if c.RetryMinSeconds <= 0 {
+		c.RetryMinSeconds = d.RetryMinSeconds
+	}
+	if c.RetryMaxSeconds <= 0 {
+		c.RetryMaxSeconds = d.RetryMaxSeconds
 	}
 	if c.TimeoutSeconds <= 0 {
 		c.TimeoutSeconds = d.TimeoutSeconds
@@ -91,6 +108,15 @@ func (c *Config) validate() error {
 	if c.IntervalSeconds < 5 {
 		return fmt.Errorf("interval_seconds must be at least 5 (got %d)", c.IntervalSeconds)
 	}
+	if c.RetryMinSeconds < 2 {
+		return fmt.Errorf("retry_min_seconds must be at least 2 (got %d)", c.RetryMinSeconds)
+	}
+	if c.RetryMaxSeconds < c.RetryMinSeconds {
+		return fmt.Errorf("retry_max_seconds (%d) must be >= retry_min_seconds (%d)", c.RetryMaxSeconds, c.RetryMinSeconds)
+	}
+	if c.RetryMaxSeconds > 3600 {
+		return fmt.Errorf("retry_max_seconds must be at most 3600 (got %d)", c.RetryMaxSeconds)
+	}
 	if c.TimeoutSeconds < 1 || c.TimeoutSeconds > 120 {
 		return fmt.Errorf("timeout_seconds must be between 1 and 120 (got %d)", c.TimeoutSeconds)
 	}
@@ -104,6 +130,14 @@ func (c *Config) validate() error {
 
 func (c *Config) interval() time.Duration {
 	return time.Duration(c.IntervalSeconds) * time.Second
+}
+
+func (c *Config) retryMin() time.Duration {
+	return time.Duration(c.RetryMinSeconds) * time.Second
+}
+
+func (c *Config) retryMax() time.Duration {
+	return time.Duration(c.RetryMaxSeconds) * time.Second
 }
 
 func (c *Config) timeout() time.Duration {

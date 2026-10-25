@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -189,40 +188,4 @@ func tryPortalURL(raw string, allowed []string) *PortalContext {
 		return nil
 	}
 	return ctx
-}
-
-// resolvePortal decides what to do on this tick. It returns online=true when
-// no login is needed, or a validated context pointing at the portal.
-func resolvePortal(cfg *Config, st *stateStore, log *Logger) (online bool, ctx *PortalContext, err error) {
-	res := probe(cfg, cfg.timeout())
-	if res.Online {
-		return true, nil, nil
-	}
-	if res.Context != nil {
-		return false, res.Context, nil
-	}
-
-	// The gateway's logout page is not always parseable. The controller
-	// still accepts a recent entry URL, so try the last known-good one.
-	candidates := []string{cfg.PortalURL, st.load().LastPortalURL}
-	for _, cand := range candidates {
-		if strings.TrimSpace(cand) == "" {
-			continue
-		}
-		parsed, perr := parsePortalURL(cand, cfg.PortalHosts)
-		if perr != nil {
-			log.Printf("cached portal URL rejected: %v", perr)
-			continue
-		}
-		log.Printf("no portal redirect parsed; using cached portal URL")
-		return false, parsed, nil
-	}
-
-	if res.FoundURL != "" {
-		return false, nil, fmt.Errorf("captive portal found at %s but it is not an allowed Omada entry URL", res.FoundURL)
-	}
-	if res.Detail != "" {
-		return false, nil, fmt.Errorf("not online and no portal URL: %s", res.Detail)
-	}
-	return false, nil, fmt.Errorf("not online and no captive portal redirect was found")
 }

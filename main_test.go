@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -242,5 +243,76 @@ func TestSystemdQuote(t *testing.T) {
 	got = systemdQuote(`/tmp/a"b`)
 	if got != `"/tmp/a\"b"` {
 		t.Errorf("quoted path = %q", got)
+	}
+	got = systemdQuote(`/tmp/100%/data`)
+	if got != `"/tmp/100%%/data"` {
+		t.Errorf("specifier path = %q", got)
+	}
+	got = systemdQuote(`/tmp/$HOME/bin`)
+	if got != `"/tmp/$$HOME/bin"` {
+		t.Errorf("variable path = %q", got)
+	}
+}
+
+func TestConfigBackoffValidation(t *testing.T) {
+	base := defaultConfig()
+	base.Username = "user"
+	base.Password = "pass"
+	base.applyDefaults()
+	if err := base.validate(); err != nil {
+		t.Fatalf("defaults should validate: %v", err)
+	}
+	if base.RetryMinSeconds != 5 || base.RetryMaxSeconds != 60 {
+		t.Fatalf("defaults: min=%d max=%d", base.RetryMinSeconds, base.RetryMaxSeconds)
+	}
+
+	cases := []struct {
+		name string
+		edit func(*Config)
+	}{
+		{"min too low", func(c *Config) { c.RetryMinSeconds = 1 }},
+		{"max below min", func(c *Config) { c.RetryMinSeconds = 30; c.RetryMaxSeconds = 10 }},
+		{"max too high", func(c *Config) { c.RetryMaxSeconds = 3601 }},
+	}
+	for _, tc := range cases {
+		c := base
+		tc.edit(&c)
+		if err := c.validate(); err == nil {
+			t.Errorf("%s: expected an error", tc.name)
+		}
+	}
+}
+
+func TestConfigBackoffDefaults(t *testing.T) {
+	var c Config
+	c.applyDefaults()
+	if c.RetryMinSeconds != 5 || c.RetryMaxSeconds != 60 || c.IntervalSeconds != 60 {
+		t.Fatalf("got interval=%d min=%d max=%d", c.IntervalSeconds, c.RetryMinSeconds, c.RetryMaxSeconds)
+	}
+}
+
+func TestNextDelay(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.IntervalSeconds = 60
+	cfg.RetryMinSeconds = 5
+	cfg.RetryMaxSeconds = 60
+	a := &app{cfg: &cfg}
+
+	delay, next := a.nextDelay(checkOutcome{Online: true}, nil, 20*time.Second)
+	if delay != 60*time.Second || next != 5*time.Second {
+		t.Fatalf("online: delay=%s next=%s", delay, next)
+	}
+
+	delay, next = a.nextDelay(checkOutcome{}, errors.New("offline"), 5*time.Second)
+	if delay != 5*time.Second || next != 10*time.Second {
+		t.Fatalf("first retry: delay=%s next=%s", delay, next)
+	}
+	delay, next = a.nextDelay(checkOutcome{}, errors.New("offline"), 40*time.Second)
+	if delay != 40*time.Second || next != 60*time.Second {
+		t.Fatalf("capped retry: delay=%s next=%s", delay, next)
+	}
+	delay, next = a.nextDelay(checkOutcome{Skipped: true}, nil, 60*time.Second)
+	if delay != 60*time.Second || next != 60*time.Second {
+		t.Fatalf("skipped: delay=%s next=%s", delay, next)
 	}
 }

@@ -24,38 +24,7 @@ func installService(spec serviceSpec) error {
 		return err
 	}
 	plistPath := filepath.Join(dir, serviceLabel+".plist")
-	interval := int(spec.Interval.Seconds())
-	if interval < 5 {
-		interval = 5
-	}
-
-	args := []string{spec.Executable, "once", "--config", spec.ConfigPath}
-	argXML := ""
-	for _, a := range args {
-		argXML += "        <string>" + html.EscapeString(a) + "</string>\n"
-	}
-	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>%s</string>
-    <key>ProgramArguments</key>
-    <array>
-%s    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>StartInterval</key>
-    <integer>%d</integer>
-    <key>ProcessType</key>
-    <string>Background</string>
-    <key>StandardOutPath</key>
-    <string>%s</string>
-    <key>StandardErrorPath</key>
-    <string>%s</string>
-</dict>
-</plist>
-`, serviceLabel, argXML, interval, html.EscapeString(spec.LogPath), html.EscapeString(spec.LogPath))
+	plist := darwinPlist(spec)
 
 	if err := os.WriteFile(plistPath, []byte(plist), 0o600); err != nil {
 		return fmt.Errorf("write LaunchAgent: %w", err)
@@ -69,6 +38,45 @@ func installService(spec serviceSpec) error {
 	_ = runCommand("launchctl", "enable", domain+"/"+serviceLabel)
 	_ = runCommand("launchctl", "kickstart", "-k", domain+"/"+serviceLabel)
 	return nil
+}
+
+func darwinPlist(spec serviceSpec) string {
+	args := []string{
+		spec.Executable,
+		"run",
+		"--config", spec.ConfigPath,
+	}
+	argXML := ""
+	for _, a := range args {
+		argXML += "        <string>" + html.EscapeString(a) + "</string>\n"
+	}
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>%s</string>
+    <key>ProgramArguments</key>
+    <array>
+%s    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>%s</string>
+    <key>StandardErrorPath</key>
+    <string>%s</string>
+</dict>
+</plist>
+`, serviceLabel, argXML, html.EscapeString(spec.LogPath), html.EscapeString(spec.LogPath))
 }
 
 func uninstallService() error {

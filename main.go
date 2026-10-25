@@ -37,6 +37,15 @@ type onceOptions struct {
 	verbose bool
 }
 
+// checkOutcome tells the daemon loop whether the network is healthy and
+// whether a login attempt actually ran.
+type checkOutcome struct {
+	Online    bool
+	Attempted bool
+	LoggedIn  bool
+	Skipped   bool
+}
+
 func main() {
 	os.Exit(runCLI(os.Args[1:]))
 }
@@ -260,57 +269,89 @@ func cmdOnce(name string, args []string) int {
 	}
 	defer a.close()
 
-	if err := a.once(onceOptions{force: *force, dryRun: *dryRun, url: *portalURL}); err != nil {
+	if _, err := a.once(onceOptions{force: *force, dryRun: *dryRun, url: *portalURL}); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 1
 	}
 	return 0
 }
 
-func (a *app) once(opts onceOptions) error {
+func (a *app) once(opts onceOptions) (checkOutcome, error) {
 	if opts.url != "" {
 		ctx, err := parsePortalURL(opts.url, a.cfg.PortalHosts)
 		if err != nil {
-			return err
+			return checkOutcome{}, err
 		}
 		if !opts.force && !opts.dryRun {
 			if res := probe(a.cfg, a.cfg.timeout()); res.Online {
 				a.log.Printf("already online; nothing to do (use --force to test a login)")
-				return nil
+				return checkOutcome{Online: true}, nil
 			}
 		}
-		return a.attempt(ctx, opts)
+		attempted, err := a.attempt(ctx, opts)
+		if err != nil {
+			return checkOutcome{Attempted: attempted}, err
+		}
+		if opts.dryRun {
+			return checkOutcome{Attempted: attempted}, nil
+		}
+		if !attempted {
+			return checkOutcome{Skipped: true}, nil
+		}
+		return checkOutcome{Online: true, Attempted: true, LoggedIn: true}, nil
 	}
 
 	res := probe(a.cfg, a.cfg.timeout())
 	if res.Online && !opts.dryRun {
 		if !opts.force {
-			return nil
+			return checkOutcome{Online: true}, nil
 		}
 		ctx := a.cachedPortal()
 		if ctx == nil {
-			return errors.New("already online and no cached portal URL to force a login with")
+			return checkOutcome{Online: true}, errors.New("already online and no cached portal URL to force a login with")
 		}
-		return a.attempt(ctx, opts)
+		attempted, err := a.attempt(ctx, opts)
+		if err != nil {
+			return checkOutcome{Online: true, Attempted: attempted}, err
+		}
+		if !attempted {
+			return checkOutcome{Online: true, Skipped: true}, nil
+		}
+		return checkOutcome{Online: true, Attempted: true, LoggedIn: true}, nil
 	}
 
 	var ctx *PortalContext
-	if res.Context != nil {
+	switch {
+	case res.Context != nil:
 		ctx = res.Context
-	} else if res.Online {
+	case res.Online:
 		fmt.Println("online: yes (nothing to log in to)")
-		return nil
-	} else {
+		return checkOutcome{Online: true}, nil
+	default:
 		ctx = a.cachedPortal()
 		if ctx == nil {
-			if res.Detail != "" {
-				return fmt.Errorf("not online and no portal URL: %s", res.Detail)
+			if res.FoundURL != "" {
+				return checkOutcome{}, fmt.Errorf("captive portal found at %s but it is not an allowed Omada entry URL", res.FoundURL)
 			}
-			return errors.New("not online and no captive portal redirect was found")
+			if res.Detail != "" {
+				return checkOutcome{}, fmt.Errorf("not online and no portal URL: %s", res.Detail)
+			}
+			return checkOutcome{}, errors.New("not online and no captive portal redirect was found")
 		}
 		a.log.Printf("no portal redirect parsed; using cached portal URL")
 	}
-	return a.attempt(ctx, opts)
+
+	attempted, err := a.attempt(ctx, opts)
+	if err != nil {
+		return checkOutcome{Attempted: attempted}, err
+	}
+	if opts.dryRun {
+		return checkOutcome{Attempted: attempted}, nil
+	}
+	if !attempted {
+		return checkOutcome{Skipped: true}, nil
+	}
+	return checkOutcome{Online: true, Attempted: true, LoggedIn: true}, nil
 }
 
 func (a *app) cachedPortal() *PortalContext {
@@ -328,41 +369,41 @@ func (a *app) cachedPortal() *PortalContext {
 	return nil
 }
 
-func (a *app) attempt(ctx *PortalContext, opts onceOptions) error {
+func (a *app) attempt(ctx *PortalContext, opts onceOptions) (bool, error) {
 	if !opts.force && !opts.dryRun && a.state.inBackoff() {
 		if opts.verbose {
 			a.log.Printf("backoff active after %d failures; skipping this attempt", failThreshold)
 		}
-		return nil
+		return false, nil
 	}
 
 	lk, ok, err := acquireLock(a.dir)
 	if err != nil {
-		return fmt.Errorf("lock: %w", err)
+		return false, fmt.Errorf("lock: %w", err)
 	}
 	if !ok {
 		if opts.verbose {
 			a.log.Printf("another instance is running; skipping")
 		}
-		return nil
+		return false, nil
 	}
 	defer lk.release()
 
 	err = doLogin(a.cfg, ctx, opts.dryRun, a.log)
 	if opts.dryRun {
-		return err
+		return true, err
 	}
 	if err != nil {
 		a.state.recordFailure(err.Error())
-		return err
+		return true, err
 	}
 	a.state.recordSuccess(ctx.PortalURL)
-	return nil
+	return true, nil
 }
 
 func cmdRun(args []string) int {
 	fs, cfgFlag, verboseFlag := newFlagSet("run")
-	interval := fs.Int("interval", 0, "seconds between checks (overrides config)")
+	interval := fs.Int("interval", 0, "online check interval in seconds (overrides config)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -376,35 +417,110 @@ func cmdRun(args []string) int {
 	if *interval > 0 {
 		a.cfg.IntervalSeconds = *interval
 	}
-	if a.cfg.IntervalSeconds < 5 {
-		return fail(errors.New("interval must be at least 5 seconds"))
+	if err := a.cfg.validate(); err != nil {
+		return fail(err)
 	}
 
-	a.log.Printf("starting loop: interval=%ds portal_hosts=%v", a.cfg.IntervalSeconds, a.cfg.PortalHosts)
-	fmt.Printf("%s running every %ds (Ctrl-C to stop)\n", appName, a.cfg.IntervalSeconds)
+	// On Linux this wakes immediately when NetworkManager changes the link or
+	// an address, so a reconnect is handled in about a second. Elsewhere it
+	// is a no-op and the normal interval is the only trigger.
+	wake := make(chan struct{}, 1)
+	stopWatch := watchNetwork(wake)
+	defer stopWatch()
+
+	a.log.Printf("starting daemon: online=%ds retry=%ds..%ds portal_hosts=%v",
+		a.cfg.IntervalSeconds, a.cfg.RetryMinSeconds, a.cfg.RetryMaxSeconds, a.cfg.PortalHosts)
+	fmt.Printf("%s running (online check every %ds, instant on network change)\n", appName, a.cfg.IntervalSeconds)
 
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(sig)
 
-	ticker := time.NewTicker(a.cfg.interval())
-	defer ticker.Stop()
-
-	run := func() {
-		if err := a.once(onceOptions{}); err != nil && verbose {
-			fmt.Fprintln(os.Stderr, "error:", err)
-		}
-	}
-	run()
+	retry := a.cfg.retryMin()
 	for {
-		select {
-		case <-ticker.C:
-			run()
-		case s := <-sig:
-			a.log.Printf("stopping on %s", s)
-			return 0
+		out, runErr := a.once(onceOptions{})
+		if runErr != nil && verbose {
+			fmt.Fprintln(os.Stderr, "error:", runErr)
 		}
+		delay, next := a.nextDelay(out, runErr, retry)
+		retry = next
+
+		timer := time.NewTimer(delay)
+	wait:
+		for {
+			select {
+			case <-timer.C:
+				break wait
+			case <-wake:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				a.state.clearFailures()
+				retry = a.cfg.retryMin()
+				a.log.Printf("network change detected; checking now")
+				break wait
+			case s := <-sig:
+				if s == syscall.SIGHUP {
+					if err := a.reload(*interval); err != nil {
+						a.log.Printf("reload failed: %v", err)
+					} else {
+						a.log.Printf("config reloaded: online=%ds retry=%ds..%ds",
+							a.cfg.IntervalSeconds, a.cfg.RetryMinSeconds, a.cfg.RetryMaxSeconds)
+					}
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					retry = a.cfg.retryMin()
+					break wait
+				}
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				a.log.Printf("stopping on %s", s)
+				return 0
+			}
+		}
+		timer.Stop()
 	}
+}
+
+// nextDelay implements the daemon's adaptive schedule: sleep for the normal
+// interval while healthy, and back off exponentially while the portal is
+// refusing or the network is down.
+func (a *app) nextDelay(out checkOutcome, err error, retry time.Duration) (time.Duration, time.Duration) {
+	if out.Online && err == nil {
+		return a.cfg.interval(), a.cfg.retryMin()
+	}
+	if retry < a.cfg.retryMin() {
+		retry = a.cfg.retryMin()
+	}
+	delay := retry
+	next := retry * 2
+	if next > a.cfg.retryMax() {
+		next = a.cfg.retryMax()
+	}
+	return delay, next
+}
+
+func (a *app) reload(intervalOverride int) error {
+	cfg, err := loadConfig(a.cfgPath)
+	if err != nil {
+		return err
+	}
+	if intervalOverride > 0 {
+		cfg.IntervalSeconds = intervalOverride
+	}
+	a.cfg = cfg
+	return nil
 }
 
 type statusReport struct {
@@ -522,10 +638,15 @@ func cmdInstall(args []string) int {
 	}
 	defer a.close()
 	if *interval > 0 {
+		// Persist the override so the installed daemon and `status` agree,
+		// and so later edits plus SIGHUP actually take effect.
 		a.cfg.IntervalSeconds = *interval
+		if err := saveConfig(a.cfgPath, a.cfg); err != nil {
+			return fail(err)
+		}
 	}
-	if a.cfg.IntervalSeconds < 5 {
-		return fail(errors.New("interval must be at least 5 seconds"))
+	if err := a.cfg.validate(); err != nil {
+		return fail(err)
 	}
 	exe, err := os.Executable()
 	if err != nil {
@@ -541,22 +662,40 @@ func cmdInstall(args []string) int {
 		DefaultLog:  filepath.Join(a.dir, appName+".log"),
 		Description: "Omada captive-portal auto-login",
 	}
-	if runtime.GOOS == "windows" && spec.Interval < time.Minute {
-		// Task Scheduler cannot repeat faster than once a minute.
-		spec.Interval = time.Minute
-	}
 	if err := installService(spec); err != nil {
 		return fail(err)
 	}
 	fmt.Printf("installed %s service\n", appName)
 	fmt.Printf("  executable: %s\n", exe)
 	fmt.Printf("  config:     %s\n", a.cfgPath)
-	fmt.Printf("  interval:   %s\n", spec.Interval)
-	if runtime.GOOS == "windows" {
-		fmt.Println("  note:       Windows Task Scheduler runs at most once per minute")
-	}
+	fmt.Printf("  mode:       daemon with restart-on-failure\n")
+	fmt.Printf("  checks:     every %s online, %s..%s while offline\n",
+		spec.Interval, a.cfg.retryMin(), a.cfg.retryMax())
 	fmt.Printf("  log:        %s\n", spec.DefaultLog)
+	for _, note := range platformNotes() {
+		fmt.Printf("  note:       %s\n", note)
+	}
 	return 0
+}
+
+// platformNotes adds distro/desktop hints without changing service behaviour.
+func platformNotes() []string {
+	var notes []string
+	if runtime.GOOS != "linux" {
+		return notes
+	}
+	if data, err := os.ReadFile("/etc/os-release"); err == nil {
+		osr := strings.ToLower(string(data))
+		if strings.Contains(osr, "id=cachyos") || strings.Contains(osr, "id=arch") {
+			notes = append(notes, "Arch/CachyOS detected: static binary, no runtime packages needed")
+		}
+	}
+	if os.Getenv("HYPRLAND_INSTANCE_SIGNATURE") != "" ||
+		strings.Contains(strings.ToLower(os.Getenv("XDG_CURRENT_DESKTOP")), "hyprland") {
+		notes = append(notes, "Hyprland detected: the systemd user service follows your session")
+	}
+	notes = append(notes, "link/address changes are handled immediately via netlink")
+	return notes
 }
 
 func cmdUninstall(args []string) int {

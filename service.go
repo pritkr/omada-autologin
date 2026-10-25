@@ -38,12 +38,14 @@ func requireNonRoot() error {
 }
 
 // systemdQuote quotes one ExecStart argument. systemd uses shell-like double
-// quotes, but does not expand variables or globs.
+// quotes, expands $VAR and %specifiers, and treats $$ / %% as literals.
 func systemdQuote(s string) string {
-	if !strings.ContainsAny(s, " \t\"'\\") {
+	if !strings.ContainsAny(s, " \t\"'\\$%") {
 		return s
 	}
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `"`, `\"`)
+	s = strings.ReplaceAll(s, "$", "$$")
+	s = strings.ReplaceAll(s, "%", "%%")
 	return `"` + s + `"`
 }
