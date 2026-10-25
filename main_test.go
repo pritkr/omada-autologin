@@ -159,6 +159,21 @@ func TestProbeCaptivePortal(t *testing.T) {
 	}
 }
 
+func TestGenerate204With200IsCaptive(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A captive gateway answering 200 for a URL that should be 204.
+		_, _ = w.Write([]byte("login"))
+	}))
+	defer srv.Close()
+
+	cfg := defaultConfig()
+	cfg.CheckURLs = []string{srv.URL + "/generate_204"}
+	res := probe(&cfg, 3*time.Second)
+	if res.Online {
+		t.Fatalf("200 for generate_204 must not count as online: %+v", res)
+	}
+}
+
 func TestProbeRedirect(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, liveURL, http.StatusFound)

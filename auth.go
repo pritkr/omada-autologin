@@ -179,7 +179,11 @@ func doLogin(cfg *Config, ctx *PortalContext, dryRun bool, log *Logger) error {
 		log.Printf("login request failed: %v", err)
 		return err
 	}
-	if res.ErrorCode != nil && *res.ErrorCode == 0 {
+	success := res.ErrorCode != nil && *res.ErrorCode == 0
+	if res.ErrorCode == nil && strings.EqualFold(strings.TrimSpace(res.Message), "success.") {
+		success = true
+	}
+	if success {
 		if waitOnline(cfg, 3*time.Second) {
 			log.Printf("login ok: %s @ %q (authType %d, client %s)", cfg.Username, ctx.SSID, method.AuthType, ctx.ClientMAC)
 			return nil

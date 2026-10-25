@@ -79,7 +79,7 @@ func probe(cfg *Config, timeout time.Duration) probeResult {
 			return res
 		}
 
-		if responseIsOnline(resp.StatusCode, body) {
+		if responseIsOnline(raw, resp.StatusCode, body) {
 			res.Online = true
 			return res
 		}
@@ -88,8 +88,10 @@ func probe(cfg *Config, timeout time.Duration) probeResult {
 }
 
 // responseIsOnline is deliberately conservative. A login page served with
-// HTTP 200 must not be mistaken for internet access.
-func responseIsOnline(status int, body []byte) bool {
+// HTTP 200 must not be mistaken for internet access. The well-known
+// connectivity URLs are checked for their expected response; custom URLs are
+// accepted when they return a non-empty 2xx page without portal markers.
+func responseIsOnline(rawURL string, status int, body []byte) bool {
 	if status == http.StatusNoContent {
 		return true
 	}
@@ -97,13 +99,18 @@ func responseIsOnline(status int, body []byte) bool {
 		return false
 	}
 	text := strings.ToLower(string(body))
-	if strings.Contains(text, "example domain") || strings.Contains(text, "<title>success</title>") {
-		return true
+	u := strings.ToLower(rawURL)
+	switch {
+	case strings.Contains(u, "example.com"):
+		return strings.Contains(text, "example domain")
+	case strings.Contains(u, "captive.apple.com"):
+		return strings.Contains(text, "<title>success</title>")
+	case strings.Contains(u, "generate_204"):
+		// generate_204 should answer 204; a 200 here is a captive page.
+		return status == http.StatusNoContent
+	default:
+		return len(body) > 0 && !hasPortalMarkers(text)
 	}
-	if len(body) > 0 && !hasPortalMarkers(text) {
-		return true
-	}
-	return false
 }
 
 func hasPortalMarkers(s string) bool {
