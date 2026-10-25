@@ -18,16 +18,20 @@ type serviceSpec struct {
 }
 
 func runCommand(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
-	out, err := cmd.CombinedOutput()
+	out, err := runCommandOutput(name, args...)
 	if err != nil {
-		msg := strings.TrimSpace(string(out))
-		if msg == "" {
+		if out == "" {
 			return fmt.Errorf("%s: %w", name, err)
 		}
-		return fmt.Errorf("%s: %w: %s", name, err, msg)
+		return fmt.Errorf("%s: %w: %s", name, err, out)
 	}
 	return nil
+}
+
+func runCommandOutput(name string, args ...string) (string, error) {
+	cmd := exec.Command(name, args...)
+	out, err := cmd.CombinedOutput()
+	return strings.TrimSpace(string(out)), err
 }
 
 func requireNonRoot() error {
