@@ -113,12 +113,14 @@ go build -trimpath -o omada-autologin .
 One command creates the config, checks the portal, and starts the daemon:
 
 ```sh
-omada-autologin setup
+omada-autologin
 ```
 
-It prompts for the portal password, then installs and starts the background
-service. The username is generated automatically; you do not need a
-registration number. For a fully non-interactive run:
+No arguments or flags are needed. It prompts for the portal password, then
+installs and starts the background service. The username is generated
+automatically; you do not need a registration number.
+
+For a fully non-interactive run, or to pass options, use `setup`:
 
 ```sh
 omada-autologin setup --password 'your-password'
@@ -336,7 +338,7 @@ launchctl kickstart -k gui/$(id -u)/com.omada.autologin   # macOS, restarts
 
 | Command | Purpose |
 |---|---|
-| `setup` | One command: create the config if needed, test the portal, then install and start the daemon. `--password`, `--host`, `--username`, `--interval`, `--no-login`, `--no-service`, `--force`. |
+| `setup` | Explicit form of the no-argument command: create the config if needed, test the portal, then install and start the daemon. `--password`, `--host`, `--username`, `--interval`, `--no-login`, `--no-service`, `--force`. |
 | `init` | Create config only. Omit `--username` to generate a random 3-digit username (001–112); pass it to keep a fixed prefix and rotate only the suffix. Flags: `--username`, `--password`, `--host`, `--portal-url`, `--random-range`, `--rotate-last`, `--rotate-min`, `--rotate-max`, `--fixed`, `--force`. |
 | `once` | One check: log in only if the network is captive. `--force` logs in even when online; `--dry-run` prints the request without sending credentials; `--url` uses a specific portal URL. |
 | `login` | Same as `once --force`. |

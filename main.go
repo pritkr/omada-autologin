@@ -53,8 +53,9 @@ func main() {
 
 func runCLI(args []string) int {
 	if len(args) == 0 {
-		printUsage(os.Stderr)
-		return 2
+		// One command, no parameters: configure if needed, check the portal,
+		// and install/start the daemon.
+		return cmdSetup(nil)
 	}
 	cmd := args[0]
 	rest := args[1:]
@@ -95,6 +96,7 @@ func printUsage(w *os.File) {
 	fmt.Fprintf(w, `%s — keep an Omada captive-portal session alive
 
 Usage:
+  %s                        set up and start (no parameters needed)
   %s setup [--password P] [--host H] [--username U] [--interval SECONDS]
   %s init [--username U] [--password P] [--host H] [--force]
             [--random-range 001-112 | --fixed]
@@ -109,9 +111,10 @@ Usage:
   %s uninstall
   %s version
 
-setup is the one command: it creates the config if needed, tests the portal
-once, then installs and starts the background daemon. Pass --password (and
-optionally --host) for a fully non-interactive run.
+Running with no arguments does everything: it creates the config if needed,
+checks the portal, then installs and starts the background daemon. setup is
+the explicit form of the same command. Pass --password (and optionally --host)
+for a fully non-interactive run.
 
 New configs need no username: each login uses a random 3-digit username
 (001-112). Pass --username to keep a fixed prefix, or --fixed to disable
@@ -125,7 +128,7 @@ Config (created by setup or init):
   %s
 
 Docs: https://github.com/pritkr/omada-autologin
-`, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, configLocationHint())
+`, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, configLocationHint())
 }
 
 func configLocationHint() string {
@@ -221,6 +224,9 @@ func cmdSetup(args []string) int {
 	}
 
 	if !configExists || *force {
+		if *password == "" && !term.IsTerminal(int(os.Stdin.Fd())) {
+			return fail(errors.New("password is required: run in a terminal, or use `setup --password P` for non-interactive setup"))
+		}
 		initArgs := append([]string{}, child...)
 		// --force also skips init's optional prompts; there is nothing to
 		// overwrite when the config is missing.
