@@ -23,11 +23,12 @@ var (
 )
 
 type app struct {
-	cfg     *Config
-	cfgPath string
-	dir     string
-	state   *stateStore
-	log     *Logger
+	cfg       *Config
+	cfgPath   string
+	dir       string
+	state     *stateStore
+	log       *Logger
+	usernames usernameRotator
 }
 
 type onceOptions struct {
@@ -75,6 +76,8 @@ func runCLI(args []string) int {
 		return cmdStatus(rest)
 	case "discover":
 		return cmdDiscover(rest)
+	case "randomize":
+		return cmdRandomize(rest)
 	case "install":
 		return cmdInstall(rest)
 	case "uninstall":
@@ -91,14 +94,21 @@ func printUsage(w *os.File) {
 
 Usage:
   %s init [--username U] [--password P] [--host H] [--force]
+            [--random-range 001-112 | --fixed]
+            [--rotate-last N --rotate-min A --rotate-max B]
   %s once [--force] [--dry-run] [--url PORTAL_URL]
   %s login [--url PORTAL_URL] [--dry-run]
   %s run [--interval SECONDS]
   %s status [--json]
   %s discover
+  %s randomize [--range 001-112 | --off]
   %s install [--interval SECONDS]
   %s uninstall
   %s version
+
+New configs randomize the last 3 username digits through 001-112 on every
+login. Use init --fixed to keep one username, or randomize to change an
+existing config.
 
 Common flags:
   --config PATH   use a different config file
@@ -108,7 +118,7 @@ Config (created by init):
   %s
 
 Docs: https://github.com/pritkr/omada-autologin
-`, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, configLocationHint())
+`, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, configLocationHint())
 }
 
 func configLocationHint() string {
@@ -171,6 +181,11 @@ func cmdInit(args []string) int {
 	password := fs.String("password", "", "portal password")
 	host := fs.String("host", "", "portal host or IP (default 192.168.1.3)")
 	portalURL := fs.String("portal-url", "", "optional last-known-good portal entry URL")
+	rotateLast := fs.Int("rotate-last", 0, "randomize the last N digits of the username (default 3)")
+	rotateMin := fs.Int("rotate-min", 0, "smallest randomized suffix, inclusive (default 1)")
+	rotateMax := fs.Int("rotate-max", 0, "largest randomized suffix, inclusive (default: 112 for 3 digits)")
+	randomRange := fs.String("random-range", "", "randomized suffix range, e.g. 001-112 (default)")
+	fixed := fs.Bool("fixed", false, "keep the username exactly as given (disable suffix rotation)")
 	force := fs.Bool("force", false, "overwrite an existing config")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -192,6 +207,39 @@ func cmdInit(args []string) int {
 	c.Username = strings.TrimSpace(*username)
 	c.Password = *password
 	c.PortalURL = strings.TrimSpace(*portalURL)
+
+	customRange := strings.TrimSpace(*randomRange) != ""
+	customRotate := *rotateLast != 0 || *rotateMin != 0 || *rotateMax != 0
+	switch {
+	case *fixed && (customRange || customRotate):
+		return fail(errors.New("--fixed cannot be combined with --rotate-last, --rotate-min, --rotate-max or --random-range"))
+	case customRange && customRotate:
+		return fail(errors.New("use either --random-range or --rotate-last/--rotate-min/--rotate-max, not both"))
+	case *rotateLast < 0:
+		return fail(errors.New("--rotate-last cannot be negative"))
+	case *rotateLast == 0 && (*rotateMin != 0 || *rotateMax != 0):
+		return fail(errors.New("--rotate-min and --rotate-max require --rotate-last"))
+	}
+	switch {
+	case *fixed:
+		c.UsernameRotation = nil
+	case customRange:
+		digits, min, max, err := parseSuffixRange(*randomRange)
+		if err != nil {
+			return fail(err)
+		}
+		c.UsernameRotation = &UsernameRotation{Enabled: true, Digits: digits, Min: min, Max: max}
+	case *rotateLast > 0:
+		min := *rotateMin
+		if min == 0 {
+			min = 1
+		}
+		max := *rotateMax
+		if max == 0 {
+			max = defaultSuffixMaxFor(*rotateLast)
+		}
+		c.UsernameRotation = &UsernameRotation{Enabled: true, Digits: *rotateLast, Min: min, Max: max}
+	}
 
 	interactive := term.IsTerminal(int(os.Stdin.Fd()))
 	if interactive && c.Username == "" {
@@ -228,15 +276,34 @@ func cmdInit(args []string) int {
 			c.PortalURL = v
 		}
 	}
+	if err := checkRotationUsername(&c, "--fixed"); err != nil {
+		return fail(err)
+	}
 	if err := saveConfig(path, &c); err != nil {
 		return fail(err)
 	}
 	fmt.Printf("wrote %s\n", path)
+	if desc := c.UsernameRotation.description(); desc != "" {
+		fmt.Printf("username rotation: %s\n", desc)
+	}
 	fmt.Printf("next: %s once --dry-run\n", appName)
 	if os.Geteuid() != 0 {
 		fmt.Printf("then: %s install\n", appName)
 	}
 	return 0
+}
+
+func checkRotationUsername(c *Config, fixedHint string) error {
+	r := c.UsernameRotation
+	if r == nil || !r.Enabled {
+		return nil
+	}
+	digits := r.digitsOrDefault()
+	if hasTrailingDigits(c.Username, digits) {
+		return nil
+	}
+	return fmt.Errorf("cannot rotate username: %q must end with %d digits; use %s to keep it fixed, or choose a username and range with matching widths",
+		c.Username, digits, fixedHint)
 }
 
 func prompt(label string, secret bool) (string, error) {
@@ -389,7 +456,11 @@ func (a *app) attempt(ctx *PortalContext, opts onceOptions) (bool, error) {
 	}
 	defer lk.release()
 
-	err = doLogin(a.cfg, ctx, opts.dryRun, a.log)
+	username, err := a.usernames.next(a.cfg)
+	if err != nil {
+		return false, err
+	}
+	err = doLoginAs(a.cfg, ctx, username, opts.dryRun, a.log)
 	if opts.dryRun {
 		return true, err
 	}
@@ -430,6 +501,9 @@ func cmdRun(args []string) int {
 
 	a.log.Printf("starting daemon: online=%ds retry=%ds..%ds portal_hosts=%v",
 		a.cfg.IntervalSeconds, a.cfg.RetryMinSeconds, a.cfg.RetryMaxSeconds, a.cfg.PortalHosts)
+	if desc := a.cfg.UsernameRotation.description(); desc != "" {
+		a.log.Printf("username rotation enabled: %s", desc)
+	}
 	fmt.Printf("%s running (online check every %ds, instant on network change)\n", appName, a.cfg.IntervalSeconds)
 
 	sig := make(chan os.Signal, 1)
@@ -520,18 +594,20 @@ func (a *app) reload(intervalOverride int) error {
 		cfg.IntervalSeconds = intervalOverride
 	}
 	a.cfg = cfg
+	a.usernames.reset()
 	return nil
 }
 
 type statusReport struct {
-	Online     bool   `json:"online"`
-	PortalURL  string `json:"portal_url,omitempty"`
-	Username   string `json:"username"`
-	ConfigPath string `json:"config_path"`
-	StatePath  string `json:"state_path"`
-	LogPath    string `json:"log_path"`
-	FailCount  int    `json:"fail_count"`
-	LastError  string `json:"last_error,omitempty"`
+	Online           bool   `json:"online"`
+	PortalURL        string `json:"portal_url,omitempty"`
+	Username         string `json:"username"`
+	UsernameRotation string `json:"username_rotation,omitempty"`
+	ConfigPath       string `json:"config_path"`
+	StatePath        string `json:"state_path"`
+	LogPath          string `json:"log_path"`
+	FailCount        int    `json:"fail_count"`
+	LastError        string `json:"last_error,omitempty"`
 }
 
 func cmdStatus(args []string) int {
@@ -551,13 +627,14 @@ func cmdStatus(args []string) int {
 	res := probe(a.cfg, a.cfg.timeout())
 	st := a.state.load()
 	report := statusReport{
-		Online:     res.Online,
-		Username:   a.cfg.Username,
-		ConfigPath: a.cfgPath,
-		StatePath:  a.state.path(),
-		LogPath:    a.log.Path(),
-		FailCount:  st.FailCount,
-		LastError:  st.LastError,
+		Online:           res.Online,
+		Username:         a.cfg.Username,
+		UsernameRotation: a.cfg.UsernameRotation.description(),
+		ConfigPath:       a.cfgPath,
+		StatePath:        a.state.path(),
+		LogPath:          a.log.Path(),
+		FailCount:        st.FailCount,
+		LastError:        st.LastError,
 	}
 	if res.Context != nil {
 		report.PortalURL = res.Context.PortalURL
@@ -583,6 +660,9 @@ func cmdStatus(args []string) int {
 		fmt.Println("portal: not found")
 	}
 	fmt.Printf("user:   %s\n", report.Username)
+	if report.UsernameRotation != "" {
+		fmt.Printf("rotate: %s\n", report.UsernameRotation)
+	}
 	fmt.Printf("config: %s\n", report.ConfigPath)
 	fmt.Printf("log:    %s\n", report.LogPath)
 	if st.FailCount > 0 {
@@ -622,6 +702,58 @@ func cmdDiscover(args []string) int {
 	}
 	fmt.Fprintln(os.Stderr, "no portal URL found")
 	return 1
+}
+
+func cmdRandomize(args []string) int {
+	fs, cfgFlag, verboseFlag := newFlagSet("randomize")
+	rangeFlag := fs.String("range", "", "suffix range to rotate through (default 001-112)")
+	off := fs.Bool("off", false, "disable username suffix rotation")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	finishFlags(fs, cfgFlag, verboseFlag)
+
+	if *off && strings.TrimSpace(*rangeFlag) != "" {
+		fmt.Fprintln(os.Stderr, "use either --range or --off, not both")
+		return 2
+	}
+
+	a, err := openApp()
+	if err != nil {
+		return fail(err)
+	}
+	defer a.close()
+
+	if *off {
+		a.cfg.UsernameRotation = nil
+		if err := saveConfig(a.cfgPath, a.cfg); err != nil {
+			return fail(err)
+		}
+		fmt.Printf("username rotation disabled; using %s\n", a.cfg.Username)
+	} else {
+		raw := strings.TrimSpace(*rangeFlag)
+		if raw == "" {
+			raw = fmt.Sprintf("%0*d-%0*d", defaultSuffixDigits, 1, defaultSuffixDigits, defaultSuffixMax)
+		}
+		digits, min, max, err := parseSuffixRange(raw)
+		if err != nil {
+			return fail(err)
+		}
+		a.cfg.UsernameRotation = &UsernameRotation{Enabled: true, Digits: digits, Min: min, Max: max}
+		if err := checkRotationUsername(a.cfg, "--off"); err != nil {
+			return fail(err)
+		}
+		if err := saveConfig(a.cfgPath, a.cfg); err != nil {
+			return fail(err)
+		}
+		prefix := a.cfg.Username[:len(a.cfg.Username)-digits]
+		fmt.Printf("username rotation: %s\n", a.cfg.UsernameRotation.description())
+		fmt.Printf("usernames:         %s%0*d ... %s%0*d\n",
+			prefix, digits, min, prefix, digits, max)
+	}
+	fmt.Printf("saved %s\n", a.cfgPath)
+	fmt.Println("reload or restart the daemon to apply it")
+	return 0
 }
 
 func cmdInstall(args []string) int {

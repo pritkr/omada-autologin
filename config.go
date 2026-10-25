@@ -11,13 +11,27 @@ import (
 	"time"
 )
 
-const appName = "omada-autologin"
+const (
+	appName = "omada-autologin"
+
+	// New configs rotate the last three digits of the username through this
+	// range by default. Set username_rotation.enabled to false to keep one
+	// fixed username.
+	defaultSuffixDigits = 3
+	defaultSuffixMax    = 112
+)
 
 // Config is the on-disk configuration. It is intentionally small: one
-// account, one set of portal hosts, one polling interval.
+// credential set (optionally rotating a numeric username suffix), one set of
+// portal hosts, one polling interval.
 type Config struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
+
+	// UsernameRotation is optional. When enabled, the last Digits characters
+	// of Username (which must be digits) are replaced with a random number
+	// from [Min, Max] on every login attempt. The password is unchanged.
+	UsernameRotation *UsernameRotation `json:"username_rotation,omitempty"`
 
 	// PortalURL is an optional last-known-good portal entry URL. It is used
 	// when the gateway's interception page cannot be parsed.
@@ -42,6 +56,19 @@ type Config struct {
 	TimeoutSeconds int `json:"timeout_seconds,omitempty"`
 }
 
+// UsernameRotation replaces the trailing digits of a username on each login.
+// New configs enable it by default; it is always bounded to the numeric range
+// declared in the config and never enumerates or guesses usernames outside it.
+type UsernameRotation struct {
+	Enabled bool `json:"enabled"`
+	// Digits is how many trailing characters of Username to replace.
+	// Defaults to 3.
+	Digits int `json:"digits,omitempty"`
+	// Min and Max bound the replacement number, inclusive.
+	Min int `json:"min,omitempty"`
+	Max int `json:"max,omitempty"`
+}
+
 var (
 	errNotConfigured = errors.New("not configured")
 	// flagConfig is set by --config on any subcommand.
@@ -50,6 +77,12 @@ var (
 
 func defaultConfig() Config {
 	return Config{
+		UsernameRotation: &UsernameRotation{
+			Enabled: true,
+			Digits:  defaultSuffixDigits,
+			Min:     1,
+			Max:     defaultSuffixMax,
+		},
 		PortalHosts: []string{"192.168.1.3"},
 		CheckURLs: []string{
 			"http://example.com/",
@@ -83,6 +116,7 @@ func (c *Config) applyDefaults() {
 	if c.TimeoutSeconds <= 0 {
 		c.TimeoutSeconds = d.TimeoutSeconds
 	}
+	c.UsernameRotation.applyDefaults()
 
 	for i, h := range c.PortalHosts {
 		h = strings.TrimSpace(h)
@@ -95,12 +129,66 @@ func (c *Config) applyDefaults() {
 	}
 }
 
+func (r *UsernameRotation) applyDefaults() {
+	if r == nil || !r.Enabled {
+		return
+	}
+	if r.Digits == 0 {
+		r.Digits = defaultSuffixDigits
+	}
+	if r.Min == 0 {
+		r.Min = 1
+	}
+	if r.Max == 0 {
+		r.Max = defaultSuffixMaxFor(r.Digits)
+	}
+}
+
+// description is a short human-readable summary for status and logs.
+func (r *UsernameRotation) description() string {
+	if r == nil || !r.Enabled {
+		return ""
+	}
+	digits := r.digitsOrDefault()
+	return fmt.Sprintf("random last %d digits (%0*d-%0*d)", digits, digits, r.Min, digits, r.Max)
+}
+
+func (r *UsernameRotation) validate(username string) error {
+	if r == nil || !r.Enabled {
+		return nil
+	}
+	digits := r.digitsOrDefault()
+	if digits < 1 || digits > maxSuffixDigits {
+		return fmt.Errorf("username_rotation.digits must be between 1 and %d (got %d)", maxSuffixDigits, digits)
+	}
+	if !hasTrailingDigits(username, digits) {
+		return fmt.Errorf("username_rotation: username %q must end with at least %d digits", username, digits)
+	}
+	limit := pow10(digits)
+	if r.Min < 1 {
+		return fmt.Errorf("username_rotation.min must be at least 1 (got %d)", r.Min)
+	}
+	if r.Max <= 0 {
+		return errors.New("username_rotation.max is required and must be greater than 0")
+	}
+	if r.Max < r.Min {
+		return fmt.Errorf("username_rotation.max (%d) must be >= min (%d)", r.Max, r.Min)
+	}
+	if r.Max >= limit {
+		return fmt.Errorf("username_rotation.max must be less than %d for %d digits (got %d)", limit, digits, r.Max)
+	}
+	return nil
+}
+
 func (c *Config) validate() error {
 	if strings.TrimSpace(c.Username) == "" {
 		return errors.New("username is empty")
 	}
 	if c.Password == "" {
 		return errors.New("password is empty")
+	}
+	if err := c.UsernameRotation.validate(c.Username); err != nil {
+		return err
 	}
 	if len(c.PortalHosts) == 0 {
 		return errors.New("portal_hosts is empty")

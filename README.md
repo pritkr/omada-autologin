@@ -9,7 +9,7 @@ session alive on **macOS, Linux and Windows**.
 Campus and guest Wi-Fi networks built on Omada often log a client out when a
 data quota resets, when the controller ages the session, or when the machine
 sleeps. This tool discovers the Omada portal entry URL that the gateway
-redirects to and re-authenticates with **your own** username and password. It
+redirects to and re-authenticates with **your own** credentials. It
 runs as one small native daemon: a static Go binary, no runtime, no timer
 spawning a new process every few seconds.
 
@@ -18,12 +18,6 @@ spawning a new process every few seconds.
 | macOS | `launchd` LaunchAgent with `KeepAlive` | 60 s online, 5–60 s adaptive retry |
 | Linux | `systemd --user` service + netlink watcher | 60 s online, **instant on link/address change**, 5–60 s retry |
 | Windows | Task Scheduler logon task with restart-on-failure | 60 s online, 5–60 s adaptive retry |
-
-> **One account only.** This tool authenticates with the single account in
-> your config. It deliberately has no username-range or rotation feature:
-> using another student's registration number would be unauthorised access to
-> their account and would consume their quota. Only use it on a network where
-> you are permitted to connect.
 
 ## Install
 
@@ -219,8 +213,14 @@ Example:
 
 ```json
 {
-  "username": "YOUR_REGISTRATION_NUMBER",
+  "username": "24105157001",
   "password": "your-password",
+  "username_rotation": {
+    "enabled": true,
+    "digits": 3,
+    "min": 1,
+    "max": 112
+  },
   "portal_url": "",
   "portal_hosts": ["192.168.1.3"],
   "check_urls": [
@@ -238,6 +238,7 @@ Example:
 | Field | Meaning |
 |---|---|
 | `username` / `password` | Your own portal credentials. |
+| `username_rotation` | New configs enable it. On each login the last `digits` digits of `username` (which must already be digits) are replaced by a number from `min` to `max`, inclusive. Set `enabled` to `false` to keep one fixed username. The password is unchanged. |
 | `portal_url` | Optional seed URL used when the gateway's logout page cannot be parsed. The last successful URL is also remembered in `state.json`. |
 | `portal_hosts` | Allow-list of controller hosts. Credentials are **only** sent to these hosts. Add the IP/hostname of your controller. |
 | `check_urls` | Plain-HTTP URLs intercepted by the captive portal. HTTPS checks are bypassed by most gateways and are less useful. |
@@ -245,6 +246,48 @@ Example:
 | `retry_min_seconds` | First retry delay while offline/rejected. Minimum 2, default 5. |
 | `retry_max_seconds` | Retry delay cap, 5–3600, default 60. |
 | `timeout_seconds` | Per-request timeout, 1–120, default 8. |
+
+### Randomized username rotation
+
+New configs rotate the last three digits of `username` through `001`–`112` on
+every login attempt. If the accounts are `24105157001` through `24105157112`, use
+the shared prefix with three trailing digits as the base:
+
+```sh
+omada-autologin init --username 24105157001 --password 'your-password'
+```
+
+Each login sends one of `24105157001`–`24105157112`: the last three digits are
+replaced and the prefix is kept. Within a run, the order is shuffled so every
+suffix is used once before any is reused, and two consecutive attempts never
+pick the same suffix. A daemon restart starts a new shuffle.
+
+Use a different range in one step:
+
+```sh
+omada-autologin init --username 24105157001 --password '...' --random-range 020-112
+```
+
+Or update an existing config without retyping the password:
+
+```sh
+omada-autologin randomize --range 020-112
+omada-autologin randomize              # restore the default 001-112
+omada-autologin randomize --off        # keep one fixed username
+```
+
+`init --fixed` also creates a fixed-username config. The last `digits`
+characters of `username` must already be digits; only that suffix changes.
+`status` shows the active range:
+
+```
+rotate: random last 3 digits (001-112)
+```
+
+The range is inclusive and bounded; the tool never sends a username outside it.
+Enable rotation only when every username in the range belongs to you or is a
+shared account you are authorised to use. The tool does not create the
+accounts: create the matching usernames in Omada with the same password.
 
 Use a different config file with `--config PATH` on any command.
 
@@ -261,12 +304,13 @@ launchctl kickstart -k gui/$(id -u)/com.omada.autologin   # macOS, restarts
 
 | Command | Purpose |
 |---|---|
-| `init` | Create config. Flags: `--username`, `--password`, `--host`, `--portal-url`, `--force`. |
+| `init` | Create config. New configs rotate the last 3 username digits through 001–112. Flags: `--username`, `--password`, `--host`, `--portal-url`, `--random-range`, `--rotate-last`, `--rotate-min`, `--rotate-max`, `--fixed`, `--force`. |
 | `once` | One check: log in only if the network is captive. `--force` logs in even when online; `--dry-run` prints the request without sending credentials; `--url` uses a specific portal URL. |
 | `login` | Same as `once --force`. |
 | `run` | Run the daemon in the foreground (debugging or your own supervisor). `--interval` temporarily overrides config. |
-| `status` | Show online state, discovered/cached portal URL, config and log paths, failure count. `--json` for machines. |
+| `status` | Show online state, discovered/cached portal URL, username rotation, config and log paths, failure count. `--json` for machines. |
 | `discover` | Print the portal entry URL, if one is visible. |
+| `randomize` | Enable or change username rotation on an existing config: `--range 001-112` (default) or `--off`. |
 | `install` | Install the native daemon service. `--interval` persists a new interval to config first. |
 | `uninstall` | Remove the background service. The config is kept. |
 | `version` | Print version. |
@@ -407,7 +451,10 @@ credentials can never be sent to an unrelated host.
 Wi-Fi off/on, copy the fresh portal URL, and run
 `omada-autologin login --url '<url>'`.
 
-**`errorCode -41527`** — unknown local user.
+**`errorCode -41527`** — unknown local user. With rotation enabled, every
+username in the configured range must exist on the controller and use the
+configured password. Create the missing users or narrow the range with
+`omada-autologin randomize --range 001-050`.
 
 **Login accepted, internet not confirmed** — usually a data/time quota. The
 tool keeps checking with backoff and retries when the portal resets the quota.
@@ -458,6 +505,8 @@ Remove-Item "$env:APPDATA\omada-autologin" -Recurse -Force
 
 - The config is written with mode `0600`; the containing directory is `0700`.
 - Credentials are sent only to hosts in `portal_hosts`.
+- Username rotation is bounded to the configured numeric range; it never sends
+  a username outside that range. Use it only for accounts you administer.
 - The portal's self-signed HTTPS certificate is accepted **only** for portal
   requests. Connectivity probes use normal certificate verification.
 - No telemetry, cloud service, or third-party API is involved.

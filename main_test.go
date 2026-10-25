@@ -3,11 +3,13 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -118,13 +120,166 @@ func TestMaskedPayloadHidesSecrets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := authMethod{Name: "radius", AuthType: 2}.payload(cfg, ctx)
+	p := authMethod{Name: "radius", AuthType: 2}.payload(cfg, ctx, cfg.Username)
 	out := maskedPayload(p)
 	if strings.Contains(out, "hunter2") {
 		t.Fatalf("secret leaked: %s", out)
 	}
 	if !strings.Contains(out, `"username":"u"`) {
 		t.Fatalf("username missing: %s", out)
+	}
+}
+
+func TestUsernameRotationPick(t *testing.T) {
+	r := &UsernameRotation{Enabled: true, Digits: 3, Min: 1, Max: 112}
+	if got := r.pickN("22BCS12345", 0); got != "22BCS12001" {
+		t.Fatalf("first value = %q", got)
+	}
+	if got := r.pickN("22BCS12345", 111); got != "22BCS12112" {
+		t.Fatalf("last value = %q", got)
+	}
+	for i := 0; i < 100; i++ {
+		got := r.pick("22BCS12345")
+		if !strings.HasPrefix(got, "22BCS12") || len(got) != len("22BCS12345") {
+			t.Fatalf("unexpected username %q", got)
+		}
+		n, err := strconv.Atoi(got[len(got)-3:])
+		if err != nil || n < 1 || n > 112 {
+			t.Fatalf("suffix out of range in %q", got)
+		}
+	}
+}
+
+func TestDoLoginDryRunUsesRotatedUsername(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/portal/getPortalPageSetting" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"errorCode":0,"result":{"authType":5}}`))
+	}))
+	defer srv.Close()
+
+	portalURL := srv.URL + "/portal/entry?cid=AA:BB:CC:DD:EE:FF&ap=11:22:33:44:55:66&ssid=TestWiFi&rid=1"
+	ctx, err := parsePortalURL(portalURL, []string{"127.0.0.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &Config{
+		Username:         "22BCS12345",
+		Password:         "test-pass",
+		PortalHosts:      []string{"127.0.0.1"},
+		TimeoutSeconds:   3,
+		UsernameRotation: &UsernameRotation{Enabled: true, Digits: 3, Min: 1, Max: 112},
+	}
+
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	dryErr := doLogin(cfg, ctx, true, nil)
+	_ = w.Close()
+	os.Stdout = old
+	out, _ := io.ReadAll(r)
+	_ = r.Close()
+	if dryErr != nil {
+		t.Fatal(dryErr)
+	}
+
+	text := string(out)
+	if !strings.Contains(text, "authType:   5 (local)") {
+		t.Fatalf("missing auth method in output:\n%s", text)
+	}
+	if !strings.Contains(text, "rotation:   random last 3 digits (001-112)") {
+		t.Fatalf("missing rotation summary in output:\n%s", text)
+	}
+	var picked string
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, "username:") {
+			picked = strings.TrimSpace(strings.TrimPrefix(line, "username:"))
+		}
+	}
+	if !strings.HasPrefix(picked, "22BCS12") || len(picked) != len("22BCS12345") {
+		t.Fatalf("unexpected username in output: %q\n%s", picked, text)
+	}
+	n, err := strconv.Atoi(picked[len(picked)-3:])
+	if err != nil || n < 1 || n > 112 {
+		t.Fatalf("suffix out of range in %q", picked)
+	}
+}
+
+func TestLoginUsernameRotationOff(t *testing.T) {
+	cfg := &Config{Username: "22BCS12345"}
+	if got := cfg.loginUsername(); got != cfg.Username {
+		t.Fatalf("got %q", got)
+	}
+	cfg.UsernameRotation = &UsernameRotation{Enabled: false, Digits: 3, Min: 1, Max: 112}
+	if got := cfg.loginUsername(); got != cfg.Username {
+		t.Fatalf("disabled rotation changed username to %q", got)
+	}
+}
+
+func TestUsernameRotationDefaults(t *testing.T) {
+	r := &UsernameRotation{Enabled: true, Min: 1, Max: 112}
+	r.applyDefaults()
+	if r.Digits != 3 {
+		t.Fatalf("digits = %d", r.Digits)
+	}
+}
+
+func TestUsernameRotationValidation(t *testing.T) {
+	valid := &UsernameRotation{Enabled: true, Digits: 3, Min: 1, Max: 112}
+	if err := valid.validate("22BCS12345"); err != nil {
+		t.Fatalf("valid rotation rejected: %v", err)
+	}
+
+	cases := []struct {
+		name     string
+		r        *UsernameRotation
+		username string
+	}{
+		{"max required", &UsernameRotation{Enabled: true, Digits: 3, Min: 1}, "22BCS12345"},
+		{"max below min", &UsernameRotation{Enabled: true, Digits: 3, Min: 112, Max: 1}, "22BCS12345"},
+		{"max too large", &UsernameRotation{Enabled: true, Digits: 3, Min: 1, Max: 1000}, "22BCS12345"},
+		{"min negative", &UsernameRotation{Enabled: true, Digits: 3, Min: -1, Max: 10}, "22BCS12345"},
+		{"bad suffix", &UsernameRotation{Enabled: true, Digits: 3, Min: 1, Max: 112}, "22BCS12abc"},
+		{"short username", &UsernameRotation{Enabled: true, Digits: 3, Min: 1, Max: 112}, "12"},
+		{"digits too large", &UsernameRotation{Enabled: true, Digits: 10, Min: 0, Max: 1}, "1234567890"},
+		{"digits negative", &UsernameRotation{Enabled: true, Digits: -1, Min: 1, Max: 10}, "22BCS12345"},
+	}
+	for _, tc := range cases {
+		if err := tc.r.validate(tc.username); err == nil {
+			t.Errorf("%s: expected an error", tc.name)
+		}
+	}
+
+	disabled := &UsernameRotation{Enabled: false, Digits: 99, Min: -1, Max: -1}
+	if err := disabled.validate("user"); err != nil {
+		t.Fatalf("disabled rotation should skip validation: %v", err)
+	}
+}
+
+func TestConfigUsernameRotationRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	cfg := defaultConfig()
+	cfg.Username = "22BCS12345"
+	cfg.Password = "test-pass"
+	cfg.UsernameRotation = &UsernameRotation{Enabled: true, Digits: 3, Min: 1, Max: 112}
+	if err := saveConfig(path, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.UsernameRotation == nil {
+		t.Fatal("username_rotation missing after round trip")
+	}
+	if *got.UsernameRotation != *cfg.UsernameRotation {
+		t.Fatalf("rotation mismatch: got %+v, want %+v", *got.UsernameRotation, *cfg.UsernameRotation)
 	}
 }
 
@@ -193,7 +348,7 @@ func TestConfigRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
 	cfg := defaultConfig()
-	cfg.Username = "test-user"
+	cfg.Username = "test-user001"
 	cfg.Password = "test-pass"
 	if err := saveConfig(path, &cfg); err != nil {
 		t.Fatal(err)
@@ -256,7 +411,7 @@ func TestSystemdQuote(t *testing.T) {
 
 func TestConfigBackoffValidation(t *testing.T) {
 	base := defaultConfig()
-	base.Username = "user"
+	base.Username = "user001"
 	base.Password = "pass"
 	base.applyDefaults()
 	if err := base.validate(); err != nil {

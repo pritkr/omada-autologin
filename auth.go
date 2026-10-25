@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"time"
@@ -88,20 +89,57 @@ func resolveAuthMethod(r settingResult) (authMethod, error) {
 	}
 }
 
-func (m authMethod) payload(cfg *Config, ctx *PortalContext) map[string]any {
+func (m authMethod) usesUsername() bool {
+	return m.Name == "radius" || m.Name == "local"
+}
+
+func (m authMethod) payload(cfg *Config, ctx *PortalContext, username string) map[string]any {
 	p := ctx.contextFields()
 	p["authType"] = m.AuthType
 	switch m.Name {
 	case "radius":
-		p["username"] = cfg.Username
+		p["username"] = username
 		p["password"] = cfg.Password
 	case "local":
-		p["localuser"] = cfg.Username
+		p["localuser"] = username
 		p["localuserPsw"] = cfg.Password
 	case "simple":
 		p["simplePassword"] = cfg.Password
 	}
 	return p
+}
+
+// loginUsername picks the username for one attempt. Rotation only ever changes
+// the trailing digits of the configured username; it never invents a different
+// prefix.
+func (c *Config) loginUsername() string {
+	r := c.UsernameRotation
+	if r == nil || !r.Enabled {
+		return c.Username
+	}
+	return r.pick(c.Username)
+}
+
+func (r *UsernameRotation) pick(base string) string {
+	if r == nil || !r.Enabled {
+		return base
+	}
+	span := r.Max - r.Min + 1
+	if span <= 0 {
+		return base
+	}
+	return r.pickN(base, rand.IntN(span))
+}
+
+// pickN is split out so tests can exercise both ends of the range without
+// depending on the random source.
+func (r *UsernameRotation) pickN(base string, offset int) string {
+	digits := r.digitsOrDefault()
+	if digits > len(base) {
+		return base
+	}
+	n := r.Min + offset
+	return base[:len(base)-digits] + fmt.Sprintf("%0*d", digits, n)
 }
 
 func maskedPayload(p map[string]any) string {
@@ -125,8 +163,15 @@ type loginResult struct {
 	Raw        string
 }
 
-// doLogin performs one portal authentication attempt.
+// doLogin performs one portal authentication attempt. It is used by tests and
+// by one-off callers; the daemon passes a username from its rotator instead.
 func doLogin(cfg *Config, ctx *PortalContext, dryRun bool, log *Logger) error {
+	return doLoginAs(cfg, ctx, cfg.loginUsername(), dryRun, log)
+}
+
+// doLoginAs is doLogin with an explicit attempt username, so the daemon can
+// rotate through the configured range without repeating a suffix.
+func doLoginAs(cfg *Config, ctx *PortalContext, username string, dryRun bool, log *Logger) error {
 	if err := ctx.validate(cfg.PortalHosts); err != nil {
 		return err
 	}
@@ -156,7 +201,11 @@ func doLogin(cfg *Config, ctx *PortalContext, dryRun bool, log *Logger) error {
 		return err
 	}
 
-	payload := method.payload(cfg, ctx)
+	sentUsername := cfg.Username
+	if method.usesUsername() {
+		sentUsername = username
+	}
+	payload := method.payload(cfg, ctx, sentUsername)
 	if dryRun {
 		fmt.Printf("portal:     %s\n", ctx.PortalURL)
 		fmt.Printf("origin:     %s\n", ctx.Origin)
@@ -166,13 +215,19 @@ func doLogin(cfg *Config, ctx *PortalContext, dryRun bool, log *Logger) error {
 		fmt.Printf("ssid:       %s\n", ctx.SSID)
 		fmt.Printf("radioId:    %s\n", ctx.RadioID)
 		fmt.Printf("authType:   %d (%s)\n", method.AuthType, method.Name)
+		if method.usesUsername() {
+			fmt.Printf("username:   %s\n", sentUsername)
+			if desc := cfg.UsernameRotation.description(); desc != "" {
+				fmt.Printf("rotation:   %s\n", desc)
+			}
+		}
 		fmt.Printf("endpoint:   %s%s\n", ctx.Origin, method.Endpoint)
 		fmt.Printf("body:       %s\n", maskedPayload(payload))
 		return nil
 	}
 
-	log.Printf("attempt: %s authType=%d client=%s ssid=%q ap=%s gw=%s",
-		method.Name, method.AuthType, ctx.ClientMAC, ctx.SSID, ctx.APMAC, ctx.GatewayMAC)
+	log.Printf("attempt: %s authType=%d user=%s client=%s ssid=%q ap=%s gw=%s",
+		method.Name, method.AuthType, sentUsername, ctx.ClientMAC, ctx.SSID, ctx.APMAC, ctx.GatewayMAC)
 
 	res, err := sendAuth(client, ctx, method, payload)
 	if err != nil {
@@ -185,10 +240,10 @@ func doLogin(cfg *Config, ctx *PortalContext, dryRun bool, log *Logger) error {
 	}
 	if success {
 		if waitOnline(cfg, 3*time.Second) {
-			log.Printf("login ok: %s @ %q (authType %d, client %s)", cfg.Username, ctx.SSID, method.AuthType, ctx.ClientMAC)
+			log.Printf("login ok: %s @ %q (authType %d, client %s)", sentUsername, ctx.SSID, method.AuthType, ctx.ClientMAC)
 			return nil
 		}
-		msg := fmt.Sprintf("login accepted but internet not confirmed: %s @ %q (authType %d)", cfg.Username, ctx.SSID, method.AuthType)
+		msg := fmt.Sprintf("login accepted but internet not confirmed: %s @ %q (authType %d)", sentUsername, ctx.SSID, method.AuthType)
 		log.Printf("%s", msg)
 		log.Printf("  if this repeats, the account may have hit its data/time quota; it will retry after the portal resets")
 		return fmt.Errorf("%s", msg)
@@ -198,15 +253,15 @@ func doLogin(cfg *Config, ctx *PortalContext, dryRun bool, log *Logger) error {
 	if res.ErrorCode != nil {
 		code = fmt.Sprint(*res.ErrorCode)
 	}
-	log.Printf("login failed: http=%d errorCode=%s msg=%q (authType %d, client %s)",
-		res.HTTPStatus, code, res.Message, method.AuthType, ctx.ClientMAC)
+	log.Printf("login failed: user=%s http=%d errorCode=%s msg=%q (authType %d, client %s)",
+		sentUsername, res.HTTPStatus, code, res.Message, method.AuthType, ctx.ClientMAC)
 	switch {
 	case res.ErrorCode != nil && *res.ErrorCode == -41525:
 		log.Printf("  -> portal says wrong password")
 	case res.ErrorCode != nil && *res.ErrorCode == -41526:
 		log.Printf("  -> portal says invalid client; toggle Wi-Fi off/on so a fresh portal URL is issued")
 	case res.ErrorCode != nil && *res.ErrorCode == -41527:
-		log.Printf("  -> portal says invalid local user")
+		log.Printf("  -> portal says invalid local user %q; create it or narrow username_rotation", sentUsername)
 	}
 	return fmt.Errorf("login rejected: errorCode %s: %s", code, res.Message)
 }
