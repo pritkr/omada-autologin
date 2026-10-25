@@ -10,7 +10,8 @@
 #   --version TAG   install a specific release (default: latest)
 #
 # Non-interactive config:
-#   OMADA_USERNAME=... OMADA_PASSWORD=... OMADA_HOST=192.168.1.3 ... | sh
+#   OMADA_PASSWORD=... OMADA_HOST=192.168.1.3 ... | sh
+#   (OMADA_USERNAME is optional; only needed when usernames share a prefix.)
 set -eu
 
 REPO="${OMADA_REPO:-pritkr/omada-autologin}"
@@ -148,9 +149,10 @@ configured=0
 if "$BIN_PATH" status >/dev/null 2>&1; then
 	configured=1
 	say "existing config found; keeping it"
-elif [ -n "${OMADA_USERNAME:-}" ] && [ -n "${OMADA_PASSWORD:-}" ]; then
-	set -- --username "$OMADA_USERNAME" --password "$OMADA_PASSWORD"
+elif [ -n "${OMADA_PASSWORD:-}" ]; then
+	set -- --password "$OMADA_PASSWORD"
 	[ -n "${OMADA_HOST:-}" ] && set -- "$@" --host "$OMADA_HOST"
+	[ -n "${OMADA_USERNAME:-}" ] && set -- "$@" --username "$OMADA_USERNAME"
 	"$BIN_PATH" init "$@"
 	configured=1
 elif [ "$have_tty" = 1 ]; then

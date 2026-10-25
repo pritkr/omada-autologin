@@ -66,6 +66,8 @@ func runCLI(args []string) int {
 	case "version", "-v", "--version":
 		fmt.Printf("%s %s\n", appName, version)
 		return 0
+	case "setup":
+		return cmdSetup(rest)
 	case "init":
 		return cmdInit(rest)
 	case "once", "login":
@@ -93,6 +95,7 @@ func printUsage(w *os.File) {
 	fmt.Fprintf(w, `%s — keep an Omada captive-portal session alive
 
 Usage:
+  %s setup [--password P] [--host H] [--username U] [--interval SECONDS]
   %s init [--username U] [--password P] [--host H] [--force]
             [--random-range 001-112 | --fixed]
             [--rotate-last N --rotate-min A --rotate-max B]
@@ -106,6 +109,10 @@ Usage:
   %s uninstall
   %s version
 
+setup is the one command: it creates the config if needed, tests the portal
+once, then installs and starts the background daemon. Pass --password (and
+optionally --host) for a fully non-interactive run.
+
 New configs need no username: each login uses a random 3-digit username
 (001-112). Pass --username to keep a fixed prefix, or --fixed to disable
 rotation. Use randomize to change an existing config.
@@ -114,11 +121,11 @@ Common flags:
   --config PATH   use a different config file
   --verbose       also write log lines to stderr
 
-Config (created by init):
+Config (created by setup or init):
   %s
 
 Docs: https://github.com/pritkr/omada-autologin
-`, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, configLocationHint())
+`, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, appName, configLocationHint())
 }
 
 func configLocationHint() string {
@@ -175,7 +182,97 @@ func (a *app) close() {
 	_ = a.log.Close()
 }
 
+// cmdSetup is the one-command path: create the config if needed, verify the
+// portal once, then install and start the background daemon.
+func cmdSetup(args []string) int {
+	fs, cfgFlag, verboseFlag := newFlagSet("setup")
+	username := fs.String("username", "", "optional username prefix to rotate")
+	password := fs.String("password", "", "portal password")
+	host := fs.String("host", "", "portal host or IP (default 192.168.1.3)")
+	interval := fs.Int("interval", 0, "seconds between checks")
+	force := fs.Bool("force", false, "rewrite an existing config")
+	noLogin := fs.Bool("no-login", false, "skip the initial login test")
+	noService := fs.Bool("no-service", false, "configure and test, but do not install the daemon")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	finishFlags(fs, cfgFlag, verboseFlag)
+	if !*noService {
+		if err := requireNonRoot(); err != nil {
+			return fail(err)
+		}
+	}
+
+	path, err := configPath()
+	if err != nil {
+		return fail(err)
+	}
+
+	child := []string{"--config", path}
+	if verbose {
+		child = append(child, "--verbose")
+	}
+
+	configExists := false
+	if _, err := os.Stat(path); err == nil {
+		configExists = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fail(fmt.Errorf("check config: %w", err))
+	}
+
+	if !configExists || *force {
+		initArgs := append([]string{}, child...)
+		// --force also skips init's optional prompts; there is nothing to
+		// overwrite when the config is missing.
+		initArgs = append(initArgs, "--force")
+		if *password != "" {
+			initArgs = append(initArgs, "--password", *password)
+		}
+		if *username != "" {
+			initArgs = append(initArgs, "--username", *username)
+		}
+		h := strings.TrimSpace(*host)
+		if h == "" {
+			h = defaultConfig().PortalHosts[0]
+		}
+		initArgs = append(initArgs, "--host", h)
+		if code := cmdInitWithHints(initArgs, false); code != 0 {
+			return code
+		}
+	} else {
+		fmt.Printf("using existing config %s (pass --force to rewrite it)\n", path)
+	}
+
+	if !*noLogin {
+		fmt.Println("checking the portal...")
+		if code := cmdOnce("once", child); code != 0 {
+			fmt.Fprintln(os.Stderr, "warning: initial check failed; the daemon will retry in the background")
+		}
+	}
+
+	if *noService {
+		fmt.Println("service not installed (--no-service)")
+		return 0
+	}
+
+	installArgs := append([]string{}, child...)
+	if *interval > 0 {
+		installArgs = append(installArgs, "--interval", fmt.Sprintf("%d", *interval))
+	}
+	if code := cmdInstall(installArgs); code != 0 {
+		return code
+	}
+	fmt.Printf("\nready: %s status\n", appName)
+	return 0
+}
+
 func cmdInit(args []string) int {
+	return cmdInitWithHints(args, true)
+}
+
+// cmdInitWithHints lets setup reuse the init flow without printing the manual
+// "do this next" steps that setup performs itself.
+func cmdInitWithHints(args []string, hints bool) int {
 	fs, cfgFlag, verboseFlag := newFlagSet("init")
 	username := fs.String("username", "", "portal username / registration number")
 	password := fs.String("password", "", "portal password")
@@ -291,9 +388,11 @@ func cmdInit(args []string) int {
 	if c.Username == "" {
 		fmt.Println("username: generated from the rotated suffix")
 	}
-	fmt.Printf("next: %s once --dry-run\n", appName)
-	if os.Geteuid() != 0 {
-		fmt.Printf("then: %s install\n", appName)
+	if hints {
+		fmt.Printf("next: %s once --dry-run\n", appName)
+		if os.Geteuid() != 0 {
+			fmt.Printf("then: %s install\n", appName)
+		}
 	}
 	return 0
 }

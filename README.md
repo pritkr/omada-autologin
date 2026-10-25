@@ -32,8 +32,8 @@ The installer:
 1. detects OS and CPU, downloads the matching release archive,
 2. verifies it against the release's `SHA256SUMS.txt`,
 3. installs the binary to `~/.local/bin/omada-autologin`,
-4. prompts for your username and password (or reads `OMADA_USERNAME`,
-   `OMADA_PASSWORD`, and optionally `OMADA_HOST`),
+4. prompts for your password (or reads `OMADA_PASSWORD`; `OMADA_HOST` and
+   `OMADA_USERNAME` are optional),
 5. runs one login test, and
 6. installs and starts the background service.
 
@@ -54,11 +54,13 @@ curl -fsSL https://raw.githubusercontent.com/pritkr/omada-autologin/main/install
 For unattended setup:
 
 ```sh
-OMADA_USERNAME='YOUR_REGISTRATION_NUMBER' \
 OMADA_PASSWORD='your-password' \
 OMADA_HOST='192.168.1.3' \
   sh -s -- --no-login < install.sh
 ```
+
+`OMADA_USERNAME` is optional. Set it only when the portal usernames share a
+fixed prefix; the last three digits still rotate.
 
 Run the script as your normal user, **not** with `sudo`.
 
@@ -108,21 +110,39 @@ go build -trimpath -o omada-autologin .
 
 ## Quick start
 
-The one-command installer does all of this for you. To do it by hand:
+One command creates the config, checks the portal, and starts the daemon:
 
 ```sh
-# 1. Create a config. Prompts for username/password; --host is the Omada
-#    controller/gateway that serves the portal.
-omada-autologin init --host 192.168.1.3
+omada-autologin setup
+```
 
-# 2. See what the tool discovered, without sending credentials.
-omada-autologin once --dry-run
+It prompts for the portal password, then installs and starts the background
+service. The username is generated automatically; you do not need a
+registration number. For a fully non-interactive run:
 
-# 3. Log in once.
-omada-autologin once
+```sh
+omada-autologin setup --password 'your-password'
+```
 
-# 4. Install and start the background daemon.
-omada-autologin install
+| Option | Meaning |
+|---|---|
+| `--host H` | Omada controller/gateway host (default `192.168.1.3`). |
+| `--username U` | Optional fixed prefix; only its last 3 digits rotate. |
+| `--interval SECONDS` | Check interval while online. |
+| `--no-login` | Skip the initial login test. |
+| `--no-service` | Configure and test, but do not install the daemon. |
+| `--force` | Rewrite an existing config. |
+
+Re-running `setup` keeps the existing config, tests the portal again, and
+restarts the service, so it also works as an "apply and restart" command.
+
+To do the same steps by hand:
+
+```sh
+omada-autologin init --host 192.168.1.3   # create config (prompts for password)
+omada-autologin once --dry-run            # inspect, no credentials sent
+omada-autologin once                      # log in once
+omada-autologin install                   # install and start the daemon
 ```
 
 Check it at any time:
@@ -316,7 +336,8 @@ launchctl kickstart -k gui/$(id -u)/com.omada.autologin   # macOS, restarts
 
 | Command | Purpose |
 |---|---|
-| `init` | Create config. Omit `--username` to generate a random 3-digit username (001–112); pass it to keep a fixed prefix and rotate only the suffix. Flags: `--username`, `--password`, `--host`, `--portal-url`, `--random-range`, `--rotate-last`, `--rotate-min`, `--rotate-max`, `--fixed`, `--force`. |
+| `setup` | One command: create the config if needed, test the portal, then install and start the daemon. `--password`, `--host`, `--username`, `--interval`, `--no-login`, `--no-service`, `--force`. |
+| `init` | Create config only. Omit `--username` to generate a random 3-digit username (001–112); pass it to keep a fixed prefix and rotate only the suffix. Flags: `--username`, `--password`, `--host`, `--portal-url`, `--random-range`, `--rotate-last`, `--rotate-min`, `--rotate-max`, `--fixed`, `--force`. |
 | `once` | One check: log in only if the network is captive. `--force` logs in even when online; `--dry-run` prints the request without sending credentials; `--url` uses a specific portal URL. |
 | `login` | Same as `once --force`. |
 | `run` | Run the daemon in the foreground (debugging or your own supervisor). `--interval` temporarily overrides config. |

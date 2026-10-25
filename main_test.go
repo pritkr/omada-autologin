@@ -190,6 +190,37 @@ func TestDoLoginDryRunUsesRotatedUsername(t *testing.T) {
 	}
 }
 
+func TestSetupCreatesConfigWithoutService(t *testing.T) {
+	defer func() {
+		flagConfig = ""
+		verbose = false
+	}()
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	args := []string{"setup", "--config", path, "--password", "test-pass", "--no-login", "--no-service"}
+	if code := runCLI(args); code != 0 {
+		t.Fatalf("setup exit = %d", code)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Username != "" {
+		t.Fatalf("generated config has username %q, want empty", cfg.Username)
+	}
+	if !cfg.rotatesUsername() {
+		t.Fatal("rotation should be enabled by default")
+	}
+	if len(cfg.PortalHosts) != 1 || cfg.PortalHosts[0] != "192.168.1.3" {
+		t.Fatalf("portal hosts = %v", cfg.PortalHosts)
+	}
+
+	// Re-running setup must reuse the existing config.
+	if code := runCLI(args); code != 0 {
+		t.Fatalf("second setup exit = %d", code)
+	}
+}
+
 func TestUsernameRotationDefaults(t *testing.T) {
 	r := &UsernameRotation{Enabled: true, Min: 1, Max: 112}
 	r.applyDefaults()

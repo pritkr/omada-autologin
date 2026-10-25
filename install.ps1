@@ -98,9 +98,10 @@ try {
         $configured = $true
         Write-Host "existing config found; keeping it"
     }
-    elseif ($env:OMADA_USERNAME -and $env:OMADA_PASSWORD) {
-        $initArgs = @("init", "--username", $env:OMADA_USERNAME, "--password", $env:OMADA_PASSWORD)
+    elseif ($env:OMADA_PASSWORD) {
+        $initArgs = @("init", "--password", $env:OMADA_PASSWORD)
         if ($env:OMADA_HOST) { $initArgs += @("--host", $env:OMADA_HOST) }
+        if ($env:OMADA_USERNAME) { $initArgs += @("--username", $env:OMADA_USERNAME) }
         Invoke-Native $exe $initArgs
         if ($script:NativeExit -ne 0) { throw "config setup failed" }
         $configured = $true
